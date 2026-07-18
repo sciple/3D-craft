@@ -213,10 +213,26 @@ impl Document {
             // is safer than panicking on an invalid SlotMap key.
             return Vec::new();
         }
+        if distance.abs() < 1e-9 {
+            // pushpull::push_pull would no-op anyway; returning before the
+            // bookkeeping below keeps the face's group/solid membership
+            // intact instead of stripping it for nothing.
+            return Vec::new();
+        }
         let was_grouped = self.face_to_group.get(&face_id).copied();
+        // A face already on a solid's boundary (a cap/wall from an earlier
+        // push_pull, or an inset split of one) extrudes in "attached" mode:
+        // no cap at the source position, so the result merges with the
+        // existing solid as one watertight shell instead of leaving a
+        // coincident interior cap that breaks manifoldness.
+        let was_solid = self.solid_face_ids.contains(&face_id);
         self.face_to_group.remove(&face_id);
         self.solid_face_ids.remove(&face_id);
-        let new_faces = pushpull::push_pull(&mut self.mesh, face_id, distance);
+        let new_faces = if was_solid {
+            pushpull::push_pull_attached(&mut self.mesh, face_id, distance)
+        } else {
+            pushpull::push_pull(&mut self.mesh, face_id, distance)
+        };
         self.solid_face_ids.extend(&new_faces);
         // Keep the extruded solid's faces in whatever group the source
         // sketch face was in, so pushing/pulling inside a group doesn't
@@ -251,31 +267,34 @@ impl Document {
     }
 
     pub fn translate_faces(&mut self, face_ids: &[FaceId], delta: DVec3) {
-        for vid in self.unique_vertices(face_ids) {
+        let moved = self.unique_vertices(face_ids);
+        for &vid in &moved {
             let p = self.mesh.position(vid);
             self.mesh.vertices[vid].position = p + delta;
         }
-        self.recompute_normals(face_ids);
+        self.recompute_normals_touching(&moved);
     }
 
     pub fn rotate_faces(&mut self, face_ids: &[FaceId], pivot: DVec3, axis: DVec3, angle_radians: f64) {
         let rotation = DQuat::from_axis_angle(axis.normalize(), angle_radians);
-        for vid in self.unique_vertices(face_ids) {
+        let moved = self.unique_vertices(face_ids);
+        for &vid in &moved {
             let p = self.mesh.position(vid);
             self.mesh.vertices[vid].position = pivot + rotation * (p - pivot);
         }
-        self.recompute_normals(face_ids);
+        self.recompute_normals_touching(&moved);
     }
 
     /// Scales relative to `pivot` along world X/Y/Z independently. Matches
     /// SketchUp's basic scale tool closely enough for v1; it does not
     /// support scaling along an arbitrary (rotated) local axis.
     pub fn scale_faces(&mut self, face_ids: &[FaceId], pivot: DVec3, scale: DVec3) {
-        for vid in self.unique_vertices(face_ids) {
+        let moved = self.unique_vertices(face_ids);
+        for &vid in &moved {
             let p = self.mesh.position(vid);
             self.mesh.vertices[vid].position = pivot + (p - pivot) * scale;
         }
-        self.recompute_normals(face_ids);
+        self.recompute_normals_touching(&moved);
     }
 
     pub fn group_faces(&mut self, face_ids: &[FaceId], name: String) -> GroupId {
@@ -328,12 +347,34 @@ impl Document {
         vertices
     }
 
-    fn recompute_normals(&mut self, face_ids: &[FaceId]) {
-        for &fid in face_ids {
-            if self.mesh.faces.contains_key(fid) {
-                self.mesh.recompute_normal(fid);
-            }
+    /// Recomputes the normal of every face referencing any vertex in
+    /// `moved` - not just the faces the user transformed. Vertices are
+    /// shared within a solid, so transforming a subset of its faces also
+    /// deforms the adjacent faces; leaving those with stale normals would
+    /// skew later push/pulls (which extrude along the stored normal) and
+    /// triangulation (which projects onto its plane).
+    fn recompute_normals_touching(&mut self, moved: &HashSet<VertexId>) {
+        let affected: Vec<FaceId> = self
+            .mesh
+            .faces
+            .iter()
+            .filter(|(_, face)| {
+                face.outer.iter().chain(face.holes.iter().flatten()).any(|v| moved.contains(v))
+            })
+            .map(|(id, _)| id)
+            .collect();
+        for fid in affected {
+            self.mesh.recompute_normal(fid);
         }
+    }
+
+    /// The faces forming solid boundaries (created by push_pull or inset
+    /// splits of them) - the printable subset STL export writes. Flat
+    /// sketch faces are excluded: they have zero thickness, so they can
+    /// never print, and leaving one lying around must not block exporting
+    /// the actual solids.
+    pub fn solid_boundary_face_ids(&self) -> Vec<FaceId> {
+        self.mesh.faces.keys().filter(|id| self.solid_face_ids.contains(id)).collect()
     }
 
     /// Builds the full render/selection payload sent to the frontend after
@@ -795,6 +836,129 @@ mod tests {
         let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(2.0, 2.0))[0];
         doc.erase_face(face_id);
         assert_eq!(doc.inset_face(face_id, 0.5), Vec::new());
+    }
+
+    #[test]
+    fn pulling_a_solids_cap_extends_it_into_one_manifold_solid() {
+        // The most common action after making a box: pull its top cap to
+        // make it taller. This must merge into a single watertight shell,
+        // not stack a second closed box (with a buried interior cap) on top
+        // of a now-open one.
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0))[0];
+        let box_faces = doc.push_pull(sketch_id, 1.0);
+
+        let top_cap = box_faces
+            .iter()
+            .copied()
+            .find(|&fid| doc.mesh.faces[fid].normal.z > 0.9)
+            .expect("box should have an upward-facing cap");
+        doc.push_pull(top_cap, 1.0);
+
+        let all_faces: Vec<FaceId> = doc.mesh.faces.keys().collect();
+        // 5 remaining original faces + 4 new wall quads + 1 new top cap.
+        assert_eq!(all_faces.len(), 10);
+        assert!(pushpull::is_manifold(&doc.mesh, &all_faces), "extended box must stay watertight");
+        let top_z = doc.mesh.vertices.values().map(|v| v.position.z).fold(f64::MIN, f64::max);
+        assert!((top_z - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn raised_panel_greeble_stays_manifold() {
+        // Box -> inset its top cap -> pull the inner panel up: the raised-
+        // panel greeble workflow this app exists for.
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0))[0];
+        let box_faces = doc.push_pull(sketch_id, 2.0);
+        let top_cap = box_faces.iter().copied().find(|&fid| doc.mesh.faces[fid].normal.z > 0.9).unwrap();
+
+        let split = doc.inset_face(top_cap, 2.0);
+        let inner = split.iter().copied().find(|&fid| doc.mesh.faces[fid].holes.is_empty()).unwrap();
+        doc.push_pull(inner, 1.0);
+
+        let all_faces: Vec<FaceId> = doc.mesh.faces.keys().collect();
+        assert!(pushpull::is_manifold(&doc.mesh, &all_faces), "raised panel must stay watertight");
+    }
+
+    #[test]
+    fn recessed_panel_greeble_stays_manifold() {
+        // Same as above but pushing the inner panel INTO the solid - a
+        // recessed panel line.
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0))[0];
+        let box_faces = doc.push_pull(sketch_id, 2.0);
+        let top_cap = box_faces.iter().copied().find(|&fid| doc.mesh.faces[fid].normal.z > 0.9).unwrap();
+
+        let split = doc.inset_face(top_cap, 2.0);
+        let inner = split.iter().copied().find(|&fid| doc.mesh.faces[fid].holes.is_empty()).unwrap();
+        doc.push_pull(inner, -0.5);
+
+        let all_faces: Vec<FaceId> = doc.mesh.faces.keys().collect();
+        assert!(pushpull::is_manifold(&doc.mesh, &all_faces), "recessed panel must stay watertight");
+        // The recess floor must face upward (out of the pocket), not down.
+        let floor = doc
+            .mesh
+            .faces
+            .values()
+            .find(|f| f.outer.iter().all(|&v| (doc.mesh.position(v).z - 1.5).abs() < 1e-9))
+            .expect("recess floor at z=1.5");
+        assert!(floor.normal.z > 0.9, "recess floor normal should point up, got {:?}", floor.normal);
+    }
+
+    #[test]
+    fn moving_part_of_a_solid_keeps_every_affected_normal_accurate() {
+        // Moving one cap of a box drags the shared vertices of all four
+        // walls with it; the walls' stored normals must be recomputed too,
+        // not just the moved cap's.
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0))[0];
+        let box_faces = doc.push_pull(sketch_id, 1.0);
+        let top_cap = box_faces.iter().copied().find(|&fid| doc.mesh.faces[fid].normal.z > 0.9).unwrap();
+
+        doc.translate_faces(&[top_cap], DVec3::new(0.5, 0.0, 0.0));
+
+        for face in doc.mesh.faces.values() {
+            let points: Vec<DVec3> = face.outer.iter().map(|&v| doc.mesh.position(v)).collect();
+            let actual = crate::geometry::mesh::newell_normal(&points);
+            assert!(
+                (face.normal - actual).length() < 1e-9,
+                "stored normal {:?} doesn't match geometry normal {:?}",
+                face.normal,
+                actual
+            );
+        }
+    }
+
+    #[test]
+    fn solid_boundary_face_ids_excludes_flat_sketches() {
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0))[0];
+        doc.push_pull(sketch_id, 1.0);
+        // A leftover construction sketch elsewhere on the ground plane.
+        doc.draw_circle(&plane, DVec2::new(10.0, 10.0), 1.0, 8);
+
+        let solids = doc.solid_boundary_face_ids();
+        assert_eq!(solids.len(), 6, "only the box's faces are printable solids");
+        assert!(pushpull::is_manifold(&doc.mesh, &solids), "the solid subset must be watertight on its own");
+    }
+
+    #[test]
+    fn push_pull_with_zero_distance_keeps_group_and_solid_membership() {
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0))[0];
+        let box_faces = doc.push_pull(sketch_id, 1.0);
+        let group_id = doc.group_faces(&box_faces, "hull".to_string());
+        let cap = box_faces[0];
+
+        assert!(doc.push_pull(cap, 0.0).is_empty());
+        assert!(doc.groups[group_id].face_ids.contains(&cap), "zero-distance push/pull must not eject the face from its group");
+        assert_eq!(doc.solid_boundary_face_ids().len(), 6, "zero-distance push/pull must not strip solid status");
     }
 
     #[test]

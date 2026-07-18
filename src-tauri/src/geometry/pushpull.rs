@@ -9,18 +9,33 @@ use super::triangulate::triangulate_face;
 /// outer loop and any hole loops, so a face-with-a-hole extrudes into a
 /// hollow tube rather than a filled solid). Returns the newly created faces.
 ///
-/// Only extrudes a fresh flat profile into a brand new solid - it does not
-/// re-stitch an existing solid's side walls the way SketchUp's push/pull can
-/// when extending a face that's already part of one. That's out of scope for
-/// v1: moving/scaling covers repositioning a part, and a fresh sketch covers
-/// building a new one.
+/// Extrudes a standalone flat sketch face. For a face that's already part of
+/// a closed solid's boundary (a cap or wall), use `push_pull_attached`
+/// instead - this variant would leave a coincident interior cap at the
+/// source position, breaking the combined shell's manifoldness.
 pub fn push_pull(mesh: &mut Mesh, face_id: FaceId, distance: f64) -> Vec<FaceId> {
+    push_pull_impl(mesh, face_id, distance, false)
+}
+
+/// Push/pull for a face lying on an existing solid's boundary. The
+/// surrounding solid already provides the surface around the source loop, so
+/// no cap is emitted at the source position - the new side walls' base edges
+/// pair directly with the neighboring faces' edges, keeping the merged shell
+/// watertight. Winding is always "forward" regardless of the distance's
+/// sign: pulling outward grows the solid, pushing inward carves a recess
+/// (the walls/cap then face the recess interior, and any overlap with the
+/// original walls nets out by winding, which slicers resolve correctly).
+pub fn push_pull_attached(mesh: &mut Mesh, face_id: FaceId, distance: f64) -> Vec<FaceId> {
+    push_pull_impl(mesh, face_id, distance, true)
+}
+
+fn push_pull_impl(mesh: &mut Mesh, face_id: FaceId, distance: f64, attached: bool) -> Vec<FaceId> {
     if distance.abs() < 1e-9 {
         return Vec::new();
     }
     let face = mesh.faces[face_id].clone();
     let offset = face.normal * distance;
-    let extruding_forward = distance >= 0.0;
+    let extruding_forward = attached || distance >= 0.0;
 
     let offset_vertex = |mesh: &mut Mesh, v: VertexId| -> VertexId {
         let p = mesh.position(v) + offset;
@@ -63,18 +78,21 @@ pub fn push_pull(mesh: &mut Mesh, face_id: FaceId, distance: f64) -> Vec<FaceId>
 
     // Caps: whichever end sits at the smaller extent along the source
     // normal faces backward (reversed winding); the other faces forward.
-    let (source_outer, source_holes) = if extruding_forward {
-        (reverse_loop(&face.outer), face.holes.iter().map(|h| reverse_loop(h)).collect::<Vec<_>>())
-    } else {
-        (face.outer.clone(), face.holes.clone())
-    };
+    // An attached extrusion emits no source-position cap at all - the
+    // surrounding solid's faces already border that loop.
+    if !attached {
+        let (source_outer, source_holes) = if extruding_forward {
+            (reverse_loop(&face.outer), face.holes.iter().map(|h| reverse_loop(h)).collect::<Vec<_>>())
+        } else {
+            (face.outer.clone(), face.holes.clone())
+        };
+        new_face_ids.push(mesh.add_face(source_outer, source_holes));
+    }
     let (far_outer, far_holes) = if extruding_forward {
         (offset_outer, offset_holes)
     } else {
         (reverse_loop(&offset_outer), offset_holes.iter().map(|h| reverse_loop(h)).collect::<Vec<_>>())
     };
-
-    new_face_ids.push(mesh.add_face(source_outer, source_holes));
     new_face_ids.push(mesh.add_face(far_outer, far_holes));
 
     mesh.remove_face(face_id);

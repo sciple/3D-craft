@@ -242,26 +242,35 @@ pub fn load_project(state: State<AppState>, path: String) -> Result<DocumentSnap
     Ok(history.document.snapshot())
 }
 
-/// Exports the whole document to a binary STL file at `path`. Refuses to
-/// write a non-manifold model rather than silently producing an STL a
-/// slicer will reject or (worse) silently misinterpret - see
-/// `pushpull::is_manifold`'s doc comment for what that check covers.
+/// Exports the document's solids to a binary STL file at `path`. Flat
+/// sketch faces are skipped (zero thickness - unprintable by definition),
+/// so a leftover construction sketch never blocks exporting the finished
+/// solids. Refuses to write a non-manifold model rather than silently
+/// producing an STL a slicer will reject or (worse) silently misinterpret -
+/// see `pushpull::is_manifold`'s doc comment for what that check covers.
 #[tauri::command]
 pub fn export_stl(state: State<AppState>, path: String) -> Result<(), String> {
     let history = state.0.lock().unwrap();
-    let mesh = &history.document.mesh;
-    let face_ids: Vec<FaceId> = mesh.faces.keys().collect();
-    if face_ids.is_empty() {
-        return Err("Nothing to export - the document is empty.".to_string());
+    let document = &history.document;
+    let solid_ids = document.solid_boundary_face_ids();
+    if solid_ids.is_empty() {
+        return Err(if document.mesh.faces.is_empty() {
+            "Nothing to export - the document is empty.".to_string()
+        } else {
+            "Nothing printable to export yet - flat sketches have no thickness. Use Push/Pull to \
+             turn them into solids first."
+                .to_string()
+        });
     }
-    if !pushpull::is_manifold(mesh, &face_ids) {
+    if !pushpull::is_manifold(&document.mesh, &solid_ids) {
         return Err(
-            "This model isn't watertight (some faces don't form a closed solid), so it won't slice \
-             correctly. Check for open/missing faces before exporting."
+            "This model isn't watertight (a solid has an open or missing face, e.g. from erasing \
+             part of it), so it won't slice correctly. Undo or rebuild the open solid before \
+             exporting."
                 .to_string(),
         );
     }
-    let bytes = stl_export::write_binary_stl(mesh, &face_ids);
+    let bytes = stl_export::write_binary_stl(&document.mesh, &solid_ids);
     std::fs::write(&path, bytes).map_err(|e| e.to_string())
 }
 
