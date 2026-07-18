@@ -3,14 +3,39 @@ import { documentStore, faceIdKey } from "../state/document-store";
 import type { FaceId } from "../state/document-store";
 import type { Tool, ToolContext } from "./types";
 import { pointerToNdc } from "./types";
+import { closestDistanceAlongAxis } from "./axis-drag";
+
+type AxisName = "x" | "y" | "z";
+
+const AXIS_VECTORS: Record<AxisName, THREE.Vector3> = {
+  x: new THREE.Vector3(1, 0, 0),
+  y: new THREE.Vector3(0, 1, 0),
+  z: new THREE.Vector3(0, 0, 1),
+};
+
+// SketchUp's axis colors: red X, green Y, blue Z - shown on the guide line
+// while an axis lock is active so the constraint is visible at a glance.
+const AXIS_COLORS: Record<AxisName, number> = {
+  x: 0xff3b30,
+  y: 0x34c759,
+  z: 0x3a7bff,
+};
+
+const GUIDE_LENGTH = 1000;
 
 /// Click a face (or, if it's part of the current selection, every selected
 /// face) and drag to translate it. Dragging moves within the horizontal
 /// plane through the clicked point by default (X/Y - the common case of
 /// repositioning a part on the workbench); holding Shift switches to a
-/// vertical drag (Z only, using screen-space vertical mouse movement),
-/// covering the other axis most spaceship-part layout needs without a full
-/// 3-axis gizmo.
+/// vertical drag (Z only, using screen-space vertical mouse movement).
+///
+/// Pressing X, Y, or Z (before or during a drag) locks movement to that
+/// world axis - the delta is the projection of the mouse ray onto the axis
+/// line through the grab point, so parts stay exactly aligned instead of
+/// drifting off-axis. Pressing the same key again unlocks; the lock
+/// persists across drags until toggled off or the tool is switched, and an
+/// axis-colored guide line through the grab point shows the constraint
+/// while dragging.
 export class MoveTool implements Tool {
   readonly name = "move";
 
@@ -20,10 +45,13 @@ export class MoveTool implements Tool {
   private startPoint = new THREE.Vector3();
   private startScreenY = 0;
   private currentDelta = new THREE.Vector3();
+  private axisLock: AxisName | null = null;
+  private lastMoveEvent: PointerEvent | null = null;
 
   private previewMesh: THREE.Mesh | null = null;
   private previewEdges: THREE.LineSegments | null = null;
   private basePositions: Float32Array | null = null;
+  private guideLine: THREE.Line | null = null;
 
   onPointerDown(e: PointerEvent, ctx: ToolContext) {
     if (e.button !== 0) return;
@@ -45,12 +73,28 @@ export class MoveTool implements Tool {
     this.currentDelta.set(0, 0, 0);
     this.dragging = true;
     this.buildPreview(ctx, this.targetFaceIds);
+    this.updateGuideLine(ctx);
   }
 
   onPointerMove(e: PointerEvent, ctx: ToolContext) {
     if (!this.dragging) return;
+    this.lastMoveEvent = e;
+    this.applyPointerDelta(e, ctx);
+  }
 
-    if (e.shiftKey) {
+  private applyPointerDelta(e: PointerEvent, ctx: ToolContext) {
+    if (this.axisLock) {
+      const axis = AXIS_VECTORS[this.axisLock];
+      const ndc = pointerToNdc(e, ctx.domElement);
+      this.raycaster.setFromCamera(ndc, ctx.camera);
+      const distance = closestDistanceAlongAxis(
+        this.startPoint,
+        axis,
+        this.raycaster.ray.origin,
+        this.raycaster.ray.direction,
+      );
+      this.currentDelta.copy(axis).multiplyScalar(distance);
+    } else if (e.shiftKey) {
       // Vertical drag: 200 screen px of vertical movement = 1 world unit at
       // the current view - simple and resolution-independent enough for
       // nudging a part up/down without needing an on-screen axis handle.
@@ -79,7 +123,18 @@ export class MoveTool implements Tool {
     }
   }
 
-  onKeyDown(e: KeyboardEvent) {
+  onKeyDown(e: KeyboardEvent, ctx: ToolContext) {
+    const key = e.key.toLowerCase();
+    if ((key === "x" || key === "y" || key === "z") && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      this.axisLock = this.axisLock === key ? null : key;
+      this.updateGuideLine(ctx);
+      if (this.dragging && this.lastMoveEvent) {
+        // Re-derive the delta immediately so toggling mid-drag snaps the
+        // preview onto (or off) the axis without waiting for a mouse move.
+        this.applyPointerDelta(this.lastMoveEvent, ctx);
+      }
+      return;
+    }
     if (e.key === "Escape" && this.dragging) {
       this.dragging = false;
       this.targetFaceIds = [];
@@ -90,6 +145,7 @@ export class MoveTool implements Tool {
   deactivate() {
     this.dragging = false;
     this.targetFaceIds = [];
+    this.axisLock = null;
     this.clearPreview();
   }
 
@@ -166,6 +222,33 @@ export class MoveTool implements Tool {
     }
   }
 
+  /// Shows an axis-colored line through the grab point along the locked
+  /// axis while dragging (or removes it when unlocked/idle) so the active
+  /// constraint is always visible.
+  private updateGuideLine(ctx: ToolContext) {
+    this.removeGuideLine();
+    if (!this.dragging || !this.axisLock) return;
+    const axis = AXIS_VECTORS[this.axisLock];
+    const a = this.startPoint.clone().addScaledVector(axis, -GUIDE_LENGTH);
+    const b = this.startPoint.clone().addScaledVector(axis, GUIDE_LENGTH);
+    const geometry = new THREE.BufferGeometry().setFromPoints([a, b]);
+    const material = new THREE.LineBasicMaterial({
+      color: AXIS_COLORS[this.axisLock],
+      transparent: true,
+      opacity: 0.6,
+    });
+    this.guideLine = new THREE.Line(geometry, material);
+    ctx.scene.add(this.guideLine);
+  }
+
+  private removeGuideLine() {
+    if (!this.guideLine) return;
+    this.guideLine.parent?.remove(this.guideLine);
+    this.guideLine.geometry.dispose();
+    (this.guideLine.material as THREE.Material).dispose();
+    this.guideLine = null;
+  }
+
   private clearPreview() {
     if (this.previewMesh) {
       this.previewMesh.parent?.remove(this.previewMesh);
@@ -180,5 +263,6 @@ export class MoveTool implements Tool {
       this.previewEdges = null;
     }
     this.basePositions = null;
+    this.removeGuideLine();
   }
 }
