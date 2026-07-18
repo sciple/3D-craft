@@ -14,6 +14,7 @@ import { RotateTool } from "./tools/rotate-tool";
 import { createToolbar } from "./ui/toolbar";
 import { createOutliner } from "./ui/outliner";
 import { createFileMenu } from "./ui/file-menu";
+import { icons } from "./ui/icons";
 
 window.addEventListener("DOMContentLoaded", async () => {
   const viewportEl = document.querySelector<HTMLElement>("#viewport");
@@ -44,15 +45,15 @@ window.addEventListener("DOMContentLoaded", async () => {
   const rotateTool = new RotateTool();
 
   createToolbar(uiRootEl, toolManager, [
-    { tool: selectTool, label: "Select", shortcut: "s" },
-    { tool: rectangleTool, label: "Rectangle", shortcut: "r" },
-    { tool: circleTool, label: "Circle", shortcut: "c" },
-    { tool: polygonTool, label: "Polygon", shortcut: "l" },
-    { tool: pushPullTool, label: "Push/Pull", shortcut: "p" },
-    { tool: insetTool, label: "Inset", shortcut: "i" },
-    { tool: scaleTool, label: "Scale", shortcut: "g" },
-    { tool: moveTool, label: "Move", shortcut: "m" },
-    { tool: rotateTool, label: "Rotate", shortcut: "t" },
+    { tool: selectTool, label: "Select", shortcut: "s", icon: icons.select },
+    { tool: rectangleTool, label: "Rectangle", shortcut: "r", icon: icons.rectangle },
+    { tool: circleTool, label: "Circle", shortcut: "c", icon: icons.circle },
+    { tool: polygonTool, label: "Polygon", shortcut: "l", icon: icons.polygon },
+    { tool: pushPullTool, label: "Push/Pull", shortcut: "p", icon: icons.pushPull },
+    { tool: insetTool, label: "Inset", shortcut: "i", icon: icons.inset },
+    { tool: scaleTool, label: "Scale", shortcut: "g", icon: icons.scale },
+    { tool: moveTool, label: "Move", shortcut: "m", icon: icons.move },
+    { tool: rotateTool, label: "Rotate", shortcut: "t", icon: icons.rotate },
   ]);
   toolManager.setTool(selectTool);
   createOutliner(uiRootEl);

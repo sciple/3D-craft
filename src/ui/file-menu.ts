@@ -1,5 +1,6 @@
 import { save, open } from "@tauri-apps/plugin-dialog";
 import { documentStore } from "../state/document-store";
+import { icons } from "./icons";
 
 /// Save/Open/Export STL - each backed by the OS's native file picker (the
 /// dialog plugin) so the user gets a normal Windows save/open dialog rather
@@ -10,15 +11,18 @@ export function createFileMenu(container: HTMLElement) {
   bar.className = "file-menu";
 
   const saveButton = document.createElement("button");
-  saveButton.textContent = "Save";
+  saveButton.title = "Save Project";
+  saveButton.innerHTML = icons.save;
   saveButton.addEventListener("click", () => void handleSave());
 
   const openButton = document.createElement("button");
-  openButton.textContent = "Open";
+  openButton.title = "Open Project";
+  openButton.innerHTML = icons.open;
   openButton.addEventListener("click", () => void handleOpen());
 
   const exportButton = document.createElement("button");
-  exportButton.textContent = "Export STL";
+  exportButton.title = "Export STL";
+  exportButton.innerHTML = icons.exportStl;
   exportButton.addEventListener("click", () => void handleExportStl());
 
   bar.append(saveButton, openButton, exportButton);

@@ -5,8 +5,12 @@ export interface ToolbarEntry {
   tool: Tool;
   label: string;
   shortcut: string;
+  icon: string;
 }
 
+/// Icon-only tool buttons (label shown as a hover tooltip, shortcut letter
+/// as a small corner badge) - a compact SketchUp-style icon strip instead
+/// of wide text buttons.
 export function createToolbar(container: HTMLElement, toolManager: ToolManager, entries: ToolbarEntry[]) {
   const bar = document.createElement("div");
   bar.className = "toolbar";
@@ -14,7 +18,12 @@ export function createToolbar(container: HTMLElement, toolManager: ToolManager, 
   const buttons = new Map<Tool, HTMLButtonElement>();
   for (const entry of entries) {
     const button = document.createElement("button");
-    button.textContent = `${entry.label} (${entry.shortcut.toUpperCase()})`;
+    button.title = `${entry.label} (${entry.shortcut.toUpperCase()})`;
+    button.innerHTML = entry.icon;
+    const badge = document.createElement("span");
+    badge.className = "shortcut-badge";
+    badge.textContent = entry.shortcut.toUpperCase();
+    button.appendChild(badge);
     button.addEventListener("click", () => toolManager.setTool(entry.tool));
     bar.appendChild(button);
     buttons.set(entry.tool, button);
