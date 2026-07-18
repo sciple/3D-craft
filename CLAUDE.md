@@ -1,0 +1,60 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+A lightweight native Windows desktop CAD tool (Rust + Tauri v2 + three.js), inspired by SketchUp's modeling workflow, for one specific use case: modeling small parts to 3D print. It is deliberately not a general CAD replacement — favor the simplest correct implementation over generality or completeness when extending it.
+
+## Commands
+
+Run all commands from the repo root unless noted.
+
+- `npm run tauri dev` — launches the full app (Vite dev server + Rust backend compiled and run in a native window). This is the primary way to run the app during development; it hot-reloads the frontend and recompiles/restarts the Rust backend on file changes.
+- `npm run dev` — Vite dev server only (frontend in a browser tab, no Tauri window/backend). Rarely useful alone since the app needs the Rust backend to do anything.
+- `npm run build` — type-checks (`tsc`) then builds the frontend for production.
+- `npx tsc --noEmit` — type-check the frontend without emitting; run this after any TypeScript change.
+- `cd src-tauri && cargo test` — runs the Rust test suite (all tests are inline `#[cfg(test)] mod tests` blocks next to the code they test, no separate `tests/` directory). Run a single test with `cargo test <test_name>`; add `-- --nocapture` to see `eprintln!`/`println!` output.
+- `cd src-tauri && cargo build` — compile the Rust backend without running it; useful for a fast correctness check.
+
+There is no separate lint command configured (no ESLint/Clippy CI step); rely on `tsc --noEmit` and `cargo test`/`cargo build` for correctness.
+
+### Windows dev-server gotcha
+
+`npm run tauri dev` runs as a long-lived background process. If it's stopped abruptly (e.g. killing the task without a clean shutdown), the Vite process holding port 1420 and/or the compiled `d-craft.exe` can survive as orphaned processes. If a subsequent `npm run tauri dev` fails to bind port 1420 or behaves oddly, kill any stale `node`/`d-craft.exe` processes before relaunching.
+
+Because `cargo test`/`cargo build`/`cargo add` share the same `target/` directory as the running dev server's file-watcher-triggered `cargo run`, running them concurrently with `tauri dev` active can cause transient, spurious compile errors (build-cache lock contention). If the dev server's log shows a confusing error right after you ran a manual cargo command, re-run `cargo build` standalone to check whether the source is actually fine before investigating further — it usually is, and the dev server recovers on its next file-triggered rebuild.
+
+## Architecture
+
+**Split of responsibility**: Rust (`src-tauri/src/`) owns all geometry/document state and is the single source of truth; the frontend (`src/`, TypeScript + three.js) owns rendering, camera, and tool/mouse interaction, and talks to Rust exclusively through Tauri `#[tauri::command]` functions in `commands.rs`. Every mutating command returns a full `DocumentSnapshot` (triangulated geometry + boundary loops + groups + selection) that the frontend uses to redraw. There's no incremental diffing — documents are small enough that resending everything each time is simpler and fast enough.
+
+**Z-up world convention** throughout (matches SketchUp and STL/3D-printing slicer conventions), not the Y-up convention common in other three.js apps.
+
+### Rust backend (`src-tauri/src/`)
+
+- `geometry/mesh.rs` — the core data model: `Mesh` holds `SlotMap<VertexId, Vertex>` and `SlotMap<FaceId, Face>` (generational-index arenas via the `slotmap` crate). A `Face` is an `outer` vertex-ID loop plus zero or more `holes` loops. **Winding is a hard invariant**: `outer` must be wound counter-clockwise as seen from `Face.normal`; every loop in `holes` must be wound the opposite way (clockwise). Faces do not share topology/vertices across unrelated draw/push-pull operations, which is what makes push/pull, erase, and export simple.
+- `geometry/plane.rs` — `Plane::from_normal(origin, normal)` builds an orthonormal right-handed `(u, v, normal)` basis for projecting 3D loop points into a 2D local coordinate system and back (`to_2d`/`to_3d`). Used everywhere a face needs 2D processing (drawing, triangulation, inset). The basis is a pure function of `normal` alone (translation-independent), so two `Plane`s built from the same normal but different origins always agree on orientation — this is relied on implicitly in several places.
+- `geometry/face_detect.rs` — given a coplanar 2D point/edge graph, traces boundary loops (half-edge "rotate to next-clockwise neighbor" algorithm) and nests them by containment into faces-with-holes. This is what makes drawing a closed loop inside an existing coplanar face auto-split it ("sticky geometry" — SketchUp's term). Only keeps positive-area (CCW) cycles as candidate loops, then **must reverse a loop before storing it as a hole** to satisfy `mesh.rs`'s winding invariant (a real bug here — hole loops stored unreversed — caused silently overlapping/wrong triangulation on any non-symmetric hole shape; see the git history around inset-tool fixes for the failure mode if touching this code).
+- `geometry/triangulate.rs` — ear-clipping triangulation of a (possibly holed) face. Holes are merged into the outer loop via nearest-vertex bridging before ear-clipping — this is a simple heuristic, not a general visibility-safe bridge, and depends on holes being correctly wound opposite the outer loop.
+- `geometry/pushpull.rs` — extrudes a flat face into a solid (or a face-with-holes into a hollow tube). Winding is sign-aware so normals always face outward regardless of push vs. pull direction. `is_manifold` checks watertightness (every triangulated edge appears exactly once in each direction) — note this does *not* catch 2D self-overlap within a single face's own triangulation, only 3D edge-pairing.
+- `geometry/inset.rs` — per-edge miter polygon offset (not a true straight skeleton), used by the Inset tool. Rejects offsets that would collapse or invert the polygon rather than returning self-intersecting geometry.
+- `geometry/primitives.rs` — rectangle/circle/polyline-loop face construction on a `Plane`.
+- `scene/document.rs` — `Document` is the whole editable model: `mesh: Mesh`, `groups: SlotMap<GroupId, Group>`, `selection: Selection`, plus private `face_to_group` and `solid_face_ids` bookkeeping. Draw operations (`draw_rectangle`/`draw_circle`/`draw_polygon`) all follow the same pattern: build a temp face, extract its loop, delete the temp face, then call `resplit_plane` to combine it with existing coplanar faces and re-run `face_detect`. `solid_face_ids` (faces created by push/pull) are excluded from `resplit_plane`'s coplanar search so an already-extruded solid's cap sitting exactly on another drawing plane doesn't get swept into an unrelated sketch. `inset_face` reuses the same `resplit_loops` helper but only resplits the *target face's own* loops (not a global coplanar search), so it works regardless of whether the target is a "solid" face.
+- `commands.rs` — `History` wraps the live `Document` plus capped (100-step) linear undo/redo stacks (`Mutex<History>` is the Tauri-managed app state). Every *modeling* command calls `history.record()` (clones the document onto the undo stack, clears redo) before mutating; pure selection commands (`select_faces`, `select_group`) intentionally don't, so Ctrl+Z undoes geometry edits rather than selection changes.
+- `io/project_file.rs` / `io/stl_export.rs` — `ProjectFile` is a flat, index-based serde mirror of `Document` (not a direct serialization — slotmap keys aren't meaningful across program runs) used for save/load. `stl_export::write_binary_stl` writes binary STL directly from triangulated faces; `commands::export_stl` refuses to export a non-manifold document.
+
+### Frontend (`src/`)
+
+- `state/document-store.ts` — `DocumentStore` is the frontend's mirror of the backend document. All Tauri `invoke()` calls are routed through an internal promise queue (`enqueue`) so commands fired in quick succession (e.g. a draw click immediately followed by a select click) apply and have their resulting snapshots land in call order, never racing.
+- `tools/` — one class per tool (`Tool` interface: `onPointerDown/Move/Up`, `onKeyDown`, `activate`/`deactivate`), wired into a `ToolManager` that dispatches raw DOM events to whichever tool is active. Tools needing a "drag along an axis with a 2D mouse" gizmo interaction (push/pull, inset) share `axis-drag.ts`'s `closestDistanceAlongAxis`. Face-targeting tools (push/pull, inset, scale, move, rotate) share the pattern: if the clicked face is part of the current selection, operate on the whole selection; otherwise operate on just the clicked face.
+- `tools/snapping.ts` — endpoint/midpoint/edge snapping for draw tools, computed entirely client-side from the already-available `DocumentSnapshot` (not a backend round-trip) since the frontend already holds full geometry after every command. Restricted to geometry lying on the ground plane (Z=0), since v1 draw tools only draw there.
+- `viewport/mesh-renderer.ts` — renders the document as one triangulated mesh plus a separate selection-highlight overlay mesh and a separate boundary-edge `LineSegments` object (drawn from `outer`/`holes` loops, not the triangulation, since ear-clip diagonals aren't real edges). Uses `flatShading: true` deliberately — faces from the same solid legitimately share vertices at hard edges, and smooth-shaded shared-vertex normals would incorrectly blend across them.
+- `viewport/controls.ts` — custom Z-up spherical camera controls (orbit/pan/zoom), SketchUp-style mouse bindings.
+- `ui/` — small vanilla-DOM UI pieces (toolbar, groups outliner panel, file save/open/export-STL menu backed by `@tauri-apps/plugin-dialog`'s native file pickers).
+
+### Cross-cutting invariants worth knowing before touching geometry code
+
+- A face's `outer` loop is always CCW as seen from `normal`; every `holes` loop is always CW. Code that builds a loop and hands it to `Mesh::add_face` or stores it as a hole must preserve this.
+- `Plane` bases for the same normal are identical regardless of origin — safe to build a fresh `Plane::from_normal` per-operation rather than threading one through.
+- FaceIds/VertexIds can be invalidated by `resplit_plane` (drawing new coplanar geometry re-detects and recreates faces, including ones not directly involved). Frontend/tests should look up current ids from the live document rather than trusting an id returned by an earlier, unrelated operation.
