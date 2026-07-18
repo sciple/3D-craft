@@ -4,6 +4,8 @@ import type { FaceId } from "../state/document-store";
 import type { Tool, ToolContext } from "./types";
 import { pointerToNdc } from "./types";
 import { closestDistanceAlongAxis } from "./axis-drag";
+import { NumericBuffer } from "./numeric-input";
+import { measurementHud } from "../ui/measurement-hud";
 
 /// Click a face and drag to extrude it along its own normal, releasing to
 /// commit. If the clicked face is part of the current selection, every
@@ -16,6 +18,11 @@ import { closestDistanceAlongAxis } from "./axis-drag";
 /// "drag along a 3D axis with a 2D mouse" technique used by translate
 /// gizmos - rather than a raw screen-space delta, so the preview tracks the
 /// mouse naturally regardless of camera angle.
+///
+/// A typed number while dragging overrides the distance (magnitude only -
+/// sign follows the current drag direction, e.g. typing "5" while pushing
+/// inward still pushes inward; type an explicit "-" to force a direction
+/// regardless of which way the mouse happened to move).
 export class PushPullTool implements Tool {
   readonly name = "pushpull";
 
@@ -25,6 +32,7 @@ export class PushPullTool implements Tool {
   private axisOrigin = new THREE.Vector3();
   private axisDir = new THREE.Vector3();
   private currentDistance = 0;
+  private numeric = new NumericBuffer();
 
   private previewMesh: THREE.Mesh | null = null;
   private previewEdges: THREE.LineSegments | null = null;
@@ -49,6 +57,7 @@ export class PushPullTool implements Tool {
     this.axisOrigin.copy(hit.point);
     this.axisDir.copy(hit.face.normal).normalize();
     this.currentDistance = 0;
+    this.numeric.clear();
     this.dragging = true;
     this.buildPreview(ctx, this.targetFaceIds);
   }
@@ -70,7 +79,7 @@ export class PushPullTool implements Tool {
     if (!this.dragging) return;
     this.dragging = false;
     const faceIds = this.targetFaceIds;
-    const distance = this.currentDistance;
+    const distance = this.effectiveDistance();
     this.targetFaceIds = [];
     this.clearPreview();
     if (faceIds.length > 0 && Math.abs(distance) > 1e-6) {
@@ -79,6 +88,21 @@ export class PushPullTool implements Tool {
   }
 
   onKeyDown(e: KeyboardEvent) {
+    if (this.dragging) {
+      if (e.key === "Enter") {
+        if (!this.numeric.isEmpty) void this.onPointerUp();
+        return;
+      }
+      if (e.key === "Escape" && !this.numeric.isEmpty) {
+        this.numeric.clear();
+        this.updatePreviewPositions();
+        return;
+      }
+      if (this.numeric.type(e)) {
+        this.updatePreviewPositions();
+        return;
+      }
+    }
     if (e.key === "Escape" && this.dragging) {
       this.dragging = false;
       this.targetFaceIds = [];
@@ -90,6 +114,18 @@ export class PushPullTool implements Tool {
     this.dragging = false;
     this.targetFaceIds = [];
     this.clearPreview();
+  }
+
+  /// The typed buffer, when non-empty, is a magnitude only unless the user
+  /// explicitly typed a '-' - so typing "5" keeps following whichever way
+  /// the mouse is currently dragging, while "-5" forces that direction
+  /// regardless of the mouse.
+  private effectiveDistance(): number {
+    if (this.numeric.isEmpty) return this.currentDistance;
+    const v = this.numeric.values()[0];
+    if (v === undefined) return this.currentDistance;
+    if (this.numeric.display.includes("-")) return v;
+    return this.currentDistance < 0 ? -Math.abs(v) : Math.abs(v);
   }
 
   /// Builds one combined preview mesh from every target face's own
@@ -162,10 +198,11 @@ export class PushPullTool implements Tool {
 
   private updatePreviewPositions() {
     if (!this.previewMesh || !this.previewEdges || !this.basePositions || !this.perVertexNormal) return;
+    const distance = this.effectiveDistance();
     const n = this.basePositions.length;
     const out = new Float32Array(n);
     for (let i = 0; i < n; i++) {
-      out[i] = this.basePositions[i] + this.perVertexNormal[i] * this.currentDistance;
+      out[i] = this.basePositions[i] + this.perVertexNormal[i] * distance;
     }
     for (const geometry of [this.previewMesh.geometry, this.previewEdges.geometry]) {
       const attr = geometry.getAttribute("position") as THREE.BufferAttribute;
@@ -174,6 +211,7 @@ export class PushPullTool implements Tool {
       geometry.computeBoundingSphere();
     }
     this.previewMesh.geometry.computeVertexNormals();
+    measurementHud.show("Push/Pull", `${distance.toFixed(1)} mm`, this.numeric.isEmpty ? null : this.numeric.display);
   }
 
   private clearPreview() {
@@ -191,5 +229,7 @@ export class PushPullTool implements Tool {
     }
     this.basePositions = null;
     this.perVertexNormal = null;
+    this.numeric.clear();
+    measurementHud.hide();
   }
 }

@@ -76,6 +76,17 @@ export class SelectTool implements Tool {
   }
 
   async onKeyDown(e: KeyboardEvent) {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "d") {
+      e.preventDefault();
+      const selected = documentStore.getSnapshot().selected_face_ids;
+      if (selected.length === 0) return;
+      // A small visible nudge (rather than an exact overlap) so the copy
+      // reads as a distinct object immediately - matches SketchUp's Copy,
+      // and leaves the copy selected and ready for a follow-up Move.
+      await documentStore.duplicateFaces(selected, [5, 5, 0]);
+      return;
+    }
+
     if (e.key !== "Delete" && e.key !== "Backspace") return;
     const selected = [...documentStore.getSnapshot().selected_face_ids];
     // Sequential awaits: each erase call returns the full post-erase

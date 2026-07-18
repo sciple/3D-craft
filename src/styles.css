@@ -182,3 +182,54 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.outliner-actions-row {
+  display: flex;
+  gap: 6px;
+  border-top: 1px solid #3a3f47;
+  padding-top: 8px;
+  margin-top: 2px;
+}
+
+.outliner-actions-row button {
+  flex: 1;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 0.8em;
+  font-weight: 500;
+  color: #f0f0f0;
+  background-color: #3a3f47;
+  cursor: pointer;
+}
+
+.outliner-actions-row button:hover:not(:disabled) {
+  background-color: #4a5058;
+}
+
+.outliner-actions-row button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.measurement-hud {
+  position: fixed;
+  left: 50%;
+  bottom: 20px;
+  transform: translateX(-50%);
+  display: none;
+  pointer-events: none;
+  background: rgba(20, 22, 26, 0.85);
+  color: #f0f0f0;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.85em;
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid #4a5058;
+  backdrop-filter: blur(4px);
+}
+
+.measurement-hud.typed {
+  border-color: #4f9dff;
+  color: #4f9dff;
+}

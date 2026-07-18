@@ -58,30 +58,64 @@ impl Document {
         }
     }
 
-    pub fn draw_rectangle(&mut self, plane: &Plane, corner_a: DVec2, corner_b: DVec2) -> Vec<FaceId> {
+    /// `target_face_id`: when the sketch was drawn on top of an existing
+    /// solid face (see `resolve_sketch_target` on the frontend), the new
+    /// loop is merged with just that face's own boundary/holes instead of
+    /// every coplanar face in the document - see `resplit` below.
+    pub fn draw_rectangle(
+        &mut self,
+        plane: &Plane,
+        corner_a: DVec2,
+        corner_b: DVec2,
+        target_face_id: Option<FaceId>,
+    ) -> Vec<FaceId> {
         let temp_face_id = primitives::add_rectangle(&mut self.mesh, plane, corner_a, corner_b);
         let new_loop = self.mesh.faces[temp_face_id].outer.clone();
         self.mesh.remove_face(temp_face_id);
-        self.resplit_plane(plane, new_loop)
+        self.resplit(plane, new_loop, target_face_id)
     }
 
-    pub fn draw_circle(&mut self, plane: &Plane, center: DVec2, radius: f64, segments: usize) -> Vec<FaceId> {
+    pub fn draw_circle(
+        &mut self,
+        plane: &Plane,
+        center: DVec2,
+        radius: f64,
+        segments: usize,
+        target_face_id: Option<FaceId>,
+    ) -> Vec<FaceId> {
         let temp_face_id = primitives::add_circle(&mut self.mesh, plane, center, radius, segments);
         let new_loop = self.mesh.faces[temp_face_id].outer.clone();
         self.mesh.remove_face(temp_face_id);
-        self.resplit_plane(plane, new_loop)
+        self.resplit(plane, new_loop, target_face_id)
     }
 
     /// Draws a closed polygon from explicit click points (the Polygon/Line
     /// tool). Point winding doesn't matter: resplit_plane's face_detect pass
     /// re-derives correct orientation from the undirected edge graph either
     /// way. Returns an empty Vec if fewer than 3 points were given.
-    pub fn draw_polygon(&mut self, plane: &Plane, points: Vec<DVec2>) -> Vec<FaceId> {
+    pub fn draw_polygon(&mut self, plane: &Plane, points: Vec<DVec2>, target_face_id: Option<FaceId>) -> Vec<FaceId> {
         let Some(temp_face_id) = primitives::add_polyline_loop(&mut self.mesh, plane, &points) else {
             return Vec::new();
         };
         let new_loop = self.mesh.faces[temp_face_id].outer.clone();
         self.mesh.remove_face(temp_face_id);
+        self.resplit(plane, new_loop, target_face_id)
+    }
+
+    /// Routes a freshly drawn loop to either a single target face's own
+    /// resplit (sketching on a solid's side wall to cut a porthole/hatch
+    /// without disturbing unrelated coplanar geometry) or the general
+    /// coplanar-search resplit (`resplit_plane`) when there's no target, or
+    /// the target no longer exists (stale id - e.g. an unrelated edit
+    /// removed it since the frontend's last snapshot). Falling back instead
+    /// of no-op-ing means a stale target never silently drops the user's
+    /// drawn shape.
+    fn resplit(&mut self, plane: &Plane, new_loop: Vec<VertexId>, target_face_id: Option<FaceId>) -> Vec<FaceId> {
+        if let Some(face_id) = target_face_id {
+            if self.mesh.faces.contains_key(face_id) {
+                return self.resplit_face_with_loops(face_id, vec![new_loop]);
+            }
+        }
         self.resplit_plane(plane, new_loop)
     }
 
@@ -137,11 +171,30 @@ impl Document {
         let Some(inset_2d) = inset::offset_polygon(&outer_2d, offset) else {
             return Vec::new();
         };
+        let inset_loop: Vec<VertexId> = inset_2d.into_iter().map(|p| self.mesh.add_vertex(plane.to_3d(p))).collect();
+
+        self.resplit_face_with_loops(face_id, vec![inset_loop])
+    }
+
+    /// Erases `face_id` and rebuilds it by resplitting its own boundary +
+    /// holes together with `extra_loops` (new loop(s) added on top of it,
+    /// e.g. an inset ring or a sketch drawn directly on this face) - a
+    /// *local* resplit restricted to this one face's own loops, unlike
+    /// `resplit_plane`'s document-wide coplanar search. New faces inherit
+    /// `face_id`'s group and solid-boundary membership, so insetting or
+    /// sketching on a face never silently ejects the result from its group
+    /// or strips its printable status. Returns an empty Vec if `face_id`
+    /// doesn't exist.
+    fn resplit_face_with_loops(&mut self, face_id: FaceId, extra_loops: Vec<Vec<VertexId>>) -> Vec<FaceId> {
+        let Some(face) = self.mesh.faces.get(face_id) else {
+            return Vec::new();
+        };
+        let origin = self.mesh.position(face.outer[0]);
+        let plane = Plane::from_normal(origin, face.normal);
 
         let mut loops = vec![face.outer.clone()];
         loops.extend(face.holes.iter().cloned());
-        let inset_loop: Vec<VertexId> = inset_2d.into_iter().map(|p| self.mesh.add_vertex(plane.to_3d(p))).collect();
-        loops.push(inset_loop);
+        loops.extend(extra_loops);
 
         let was_grouped = self.face_to_group.get(&face_id).copied();
         let was_solid = self.solid_face_ids.contains(&face_id);
@@ -295,6 +348,73 @@ impl Document {
             self.mesh.vertices[vid].position = pivot + (p - pivot) * scale;
         }
         self.recompute_normals_touching(&moved);
+    }
+
+    pub fn duplicate_faces(&mut self, face_ids: &[FaceId], delta: DVec3) -> Vec<FaceId> {
+        let new_faces = self.clone_faces_mapped(face_ids, |p| p + delta, false);
+        self.selection.faces = new_faces.iter().copied().collect();
+        new_faces
+    }
+
+    /// Mirrors a *copy* of `face_ids` across the world plane perpendicular
+    /// to `axis` through `pivot` (e.g. `MirrorAxis::X` mirrors across the
+    /// plane x = pivot.x) - the source geometry is left untouched, matching
+    /// SketchUp's Mirror. Building one half of a symmetric hull/wing and
+    /// mirroring a copy is the common case this exists for.
+    pub fn mirror_faces(&mut self, face_ids: &[FaceId], axis: MirrorAxis, pivot: DVec3) -> Vec<FaceId> {
+        let reflect = move |p: DVec3| -> DVec3 {
+            match axis {
+                MirrorAxis::X => DVec3::new(2.0 * pivot.x - p.x, p.y, p.z),
+                MirrorAxis::Y => DVec3::new(p.x, 2.0 * pivot.y - p.y, p.z),
+                MirrorAxis::Z => DVec3::new(p.x, p.y, 2.0 * pivot.z - p.z),
+            }
+        };
+        let new_faces = self.clone_faces_mapped(face_ids, reflect, true);
+        self.selection.faces = new_faces.iter().copied().collect();
+        new_faces
+    }
+
+    /// Clones `face_ids` into new faces through a single shared vertex map,
+    /// so faces that share vertices in the source (e.g. every face of a
+    /// solid) keep sharing them in the copy - required for the copy to be
+    /// manifold on its own, not just a pile of individually-closed faces.
+    /// `map_pos` repositions each newly cloned vertex; `reverse_winding`
+    /// reverses every loop (outer and holes), which a mirror needs to
+    /// restore the CCW-outer/CW-hole invariant after a reflection flips
+    /// handedness (a plain translation preserves handedness and must NOT
+    /// reverse). Copies inherit their source face's solid-boundary
+    /// membership but join no group - detaching from a group on copy
+    /// matches SketchUp's Copy/Mirror.
+    fn clone_faces_mapped(
+        &mut self,
+        face_ids: &[FaceId],
+        map_pos: impl Fn(DVec3) -> DVec3,
+        reverse_winding: bool,
+    ) -> Vec<FaceId> {
+        let mut vertex_map: HashMap<VertexId, VertexId> = HashMap::new();
+        let mut new_face_ids = Vec::new();
+
+        for &face_id in face_ids {
+            let Some(face) = self.mesh.faces.get(face_id).cloned() else {
+                continue;
+            };
+            let was_solid = self.solid_face_ids.contains(&face_id);
+
+            let outer = clone_loop_through_map(&mut self.mesh, &mut vertex_map, &face.outer, &map_pos, reverse_winding);
+            let holes: Vec<Vec<VertexId>> = face
+                .holes
+                .iter()
+                .map(|h| clone_loop_through_map(&mut self.mesh, &mut vertex_map, h, &map_pos, reverse_winding))
+                .collect();
+
+            let new_id = self.mesh.add_face(outer, holes);
+            if was_solid {
+                self.solid_face_ids.insert(new_id);
+            }
+            new_face_ids.push(new_id);
+        }
+
+        new_face_ids
     }
 
     pub fn group_faces(&mut self, face_ids: &[FaceId], name: String) -> GroupId {
@@ -498,6 +618,43 @@ impl Document {
     }
 }
 
+/// Which world plane a mirror reflects across: `X` is the plane x = pivot.x
+/// (flips left/right), and so on. Deserialized from the lowercase strings
+/// "x"/"y"/"z" the frontend sends.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MirrorAxis {
+    X,
+    Y,
+    Z,
+}
+
+/// Maps each vertex of `loop_verts` through `vertex_map` (inserting a freshly
+/// cloned, `map_pos`-repositioned vertex on first sight of a given source
+/// id, reusing it on every later sight - the sharing that keeps a cloned
+/// solid manifold), then reverses the result if `reverse_winding`.
+fn clone_loop_through_map(
+    mesh: &mut Mesh,
+    vertex_map: &mut HashMap<VertexId, VertexId>,
+    loop_verts: &[VertexId],
+    map_pos: &impl Fn(DVec3) -> DVec3,
+    reverse_winding: bool,
+) -> Vec<VertexId> {
+    let mut cloned: Vec<VertexId> = loop_verts
+        .iter()
+        .map(|&v| {
+            *vertex_map.entry(v).or_insert_with(|| {
+                let p = mesh.position(v);
+                mesh.add_vertex(map_pos(p))
+            })
+        })
+        .collect();
+    if reverse_winding {
+        cloned.reverse();
+    }
+    cloned
+}
+
 /// A face is coplanar with `plane` when it faces the same way (not the
 /// opposite side of the same plane) and every one of its outer-loop vertices
 /// lies on it within tolerance.
@@ -551,7 +708,7 @@ mod tests {
     fn draw_push_pull_and_snapshot_round_trip() {
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
-        let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0))[0];
+        let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0), None)[0];
         doc.push_pull(face_id, 1.0);
         let snapshot = doc.snapshot();
         assert_eq!(snapshot.faces.len(), 6);
@@ -562,7 +719,7 @@ mod tests {
     fn push_pull_with_a_stale_face_id_is_a_no_op_not_a_panic() {
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
-        let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0))[0];
+        let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0), None)[0];
         doc.erase_face(face_id);
         assert_eq!(doc.push_pull(face_id, 1.0), Vec::new());
     }
@@ -571,8 +728,8 @@ mod tests {
     fn push_pull_faces_extrudes_every_selected_face_along_its_own_normal() {
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
-        doc.draw_rectangle(&plane, DVec2::new(0.0, 0.0), DVec2::new(1.0, 1.0));
-        doc.draw_rectangle(&plane, DVec2::new(5.0, 5.0), DVec2::new(6.0, 6.0));
+        doc.draw_rectangle(&plane, DVec2::new(0.0, 0.0), DVec2::new(1.0, 1.0), None);
+        doc.draw_rectangle(&plane, DVec2::new(5.0, 5.0), DVec2::new(6.0, 6.0), None);
         // Both rectangles are coplanar, so drawing the second one resplits
         // (and reassigns the FaceId of) the first - look both up fresh
         // afterward rather than trusting either draw call's return value.
@@ -600,7 +757,7 @@ mod tests {
             DVec2::new(1.0, 2.0),
             DVec2::new(0.0, 2.0),
         ];
-        let face_ids = doc.draw_polygon(&plane, points);
+        let face_ids = doc.draw_polygon(&plane, points, None);
         assert_eq!(face_ids.len(), 1);
         assert_eq!(doc.mesh.faces[face_ids[0]].outer.len(), 6);
 
@@ -612,7 +769,7 @@ mod tests {
     fn draw_polygon_with_fewer_than_three_points_does_nothing() {
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
-        let face_ids = doc.draw_polygon(&plane, vec![DVec2::ZERO, DVec2::new(1.0, 0.0)]);
+        let face_ids = doc.draw_polygon(&plane, vec![DVec2::ZERO, DVec2::new(1.0, 0.0)], None);
         assert!(face_ids.is_empty());
         assert!(doc.mesh.faces.is_empty());
     }
@@ -621,7 +778,7 @@ mod tests {
     fn erase_face_removes_it_from_its_group() {
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
-        let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0))[0];
+        let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0), None)[0];
         let group_id = doc.group_faces(&[face_id], "hull".to_string());
         doc.erase_face(face_id);
         assert!(doc.groups[group_id].face_ids.is_empty());
@@ -631,8 +788,8 @@ mod tests {
     fn translate_moves_only_the_given_faces() {
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
-        doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0));
-        doc.draw_rectangle(&plane, DVec2::new(5.0, 5.0), DVec2::new(6.0, 6.0));
+        doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0), None);
+        doc.draw_rectangle(&plane, DVec2::new(5.0, 5.0), DVec2::new(6.0, 6.0), None);
 
         // Both rectangles are coplanar, so drawing the second one resplits
         // (and thus reassigns the FaceId of) both - look them up by position
@@ -667,13 +824,13 @@ mod tests {
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
 
-        let first_id = doc.draw_rectangle(&plane, DVec2::new(-10.0, -10.0), DVec2::new(-8.0, -8.0))[0];
+        let first_id = doc.draw_rectangle(&plane, DVec2::new(-10.0, -10.0), DVec2::new(-8.0, -8.0), None)[0];
         doc.push_pull(first_id, -2.0);
         let solid_face_count = doc.mesh.faces.len();
         assert_eq!(solid_face_count, 6); // a box
 
-        doc.draw_circle(&plane, DVec2::ZERO, 5.0, 16);
-        doc.draw_circle(&plane, DVec2::ZERO, 2.0, 16);
+        doc.draw_circle(&plane, DVec2::ZERO, 5.0, 16, None);
+        doc.draw_circle(&plane, DVec2::ZERO, 2.0, 16, None);
 
         assert_eq!(doc.mesh.faces.len(), solid_face_count + 2, "old solid's faces must be untouched");
         let faces_with_holes = doc.mesh.faces.values().filter(|f| !f.holes.is_empty()).count();
@@ -684,8 +841,8 @@ mod tests {
     fn drawing_a_circle_inside_another_auto_splits_into_ring_and_inner_face() {
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
-        doc.draw_circle(&plane, DVec2::ZERO, 5.0, 16);
-        doc.draw_circle(&plane, DVec2::ZERO, 2.0, 16);
+        doc.draw_circle(&plane, DVec2::ZERO, 5.0, 16, None);
+        doc.draw_circle(&plane, DVec2::ZERO, 2.0, 16, None);
 
         assert_eq!(doc.mesh.faces.len(), 2);
         let faces_with_holes = doc.mesh.faces.values().filter(|f| !f.holes.is_empty()).count();
@@ -696,8 +853,8 @@ mod tests {
     fn erasing_inner_circle_leaves_the_outer_as_a_printable_ring() {
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
-        doc.draw_circle(&plane, DVec2::ZERO, 5.0, 16);
-        doc.draw_circle(&plane, DVec2::ZERO, 2.0, 16);
+        doc.draw_circle(&plane, DVec2::ZERO, 5.0, 16, None);
+        doc.draw_circle(&plane, DVec2::ZERO, 2.0, 16, None);
 
         let inner_face_id = doc.mesh.faces.iter().find(|(_, f)| f.holes.is_empty()).unwrap().0;
         doc.erase_face(inner_face_id);
@@ -715,7 +872,7 @@ mod tests {
     fn inset_face_splits_a_rectangle_into_an_inner_face_and_a_framed_hole() {
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
-        let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0))[0];
+        let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), None)[0];
 
         let new_faces = doc.inset_face(face_id, 2.0);
         assert_eq!(new_faces.len(), 2);
@@ -735,7 +892,7 @@ mod tests {
     fn inset_face_preserves_group_and_solid_membership() {
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
-        let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0))[0];
+        let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), None)[0];
         let group_id = doc.group_faces(&[face_id], "panel".to_string());
 
         let new_faces = doc.inset_face(face_id, 2.0);
@@ -758,7 +915,7 @@ mod tests {
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
         let points = vec![DVec2::new(0.0, 0.0), DVec2::new(4.0, 0.0), DVec2::new(2.0, 3.0)];
-        let tri_id = doc.draw_polygon(&plane, points)[0];
+        let tri_id = doc.draw_polygon(&plane, points, None)[0];
         let outer_area = 6.0; // base 4 * height 3 / 2
 
         let new_faces = doc.inset_face(tri_id, 0.3);
@@ -785,7 +942,7 @@ mod tests {
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
         let points = vec![DVec2::new(0.0, 0.0), DVec2::new(4.0, 0.0), DVec2::new(2.0, 3.0)];
-        let tri_id = doc.draw_polygon(&plane, points)[0];
+        let tri_id = doc.draw_polygon(&plane, points, None)[0];
         let solid_faces = doc.push_pull(tri_id, 2.0);
         let angled_id = solid_faces
             .iter()
@@ -823,7 +980,7 @@ mod tests {
     fn inset_face_with_an_offset_too_large_for_the_shape_is_a_no_op() {
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
-        let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(2.0, 2.0))[0];
+        let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(2.0, 2.0), None)[0];
 
         assert_eq!(doc.inset_face(face_id, 5.0), Vec::new());
         assert_eq!(doc.mesh.faces.len(), 1, "the original face must be untouched");
@@ -833,7 +990,7 @@ mod tests {
     fn inset_face_with_a_stale_face_id_is_a_no_op_not_a_panic() {
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
-        let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(2.0, 2.0))[0];
+        let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(2.0, 2.0), None)[0];
         doc.erase_face(face_id);
         assert_eq!(doc.inset_face(face_id, 0.5), Vec::new());
     }
@@ -846,7 +1003,7 @@ mod tests {
         // of a now-open one.
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
-        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0))[0];
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0), None)[0];
         let box_faces = doc.push_pull(sketch_id, 1.0);
 
         let top_cap = box_faces
@@ -870,7 +1027,7 @@ mod tests {
         // panel greeble workflow this app exists for.
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
-        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0))[0];
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), None)[0];
         let box_faces = doc.push_pull(sketch_id, 2.0);
         let top_cap = box_faces.iter().copied().find(|&fid| doc.mesh.faces[fid].normal.z > 0.9).unwrap();
 
@@ -888,7 +1045,7 @@ mod tests {
         // recessed panel line.
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
-        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0))[0];
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), None)[0];
         let box_faces = doc.push_pull(sketch_id, 2.0);
         let top_cap = box_faces.iter().copied().find(|&fid| doc.mesh.faces[fid].normal.z > 0.9).unwrap();
 
@@ -915,7 +1072,7 @@ mod tests {
         // not just the moved cap's.
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
-        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0))[0];
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0), None)[0];
         let box_faces = doc.push_pull(sketch_id, 1.0);
         let top_cap = box_faces.iter().copied().find(|&fid| doc.mesh.faces[fid].normal.z > 0.9).unwrap();
 
@@ -937,10 +1094,10 @@ mod tests {
     fn solid_boundary_face_ids_excludes_flat_sketches() {
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
-        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0))[0];
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0), None)[0];
         doc.push_pull(sketch_id, 1.0);
         // A leftover construction sketch elsewhere on the ground plane.
-        doc.draw_circle(&plane, DVec2::new(10.0, 10.0), 1.0, 8);
+        doc.draw_circle(&plane, DVec2::new(10.0, 10.0), 1.0, 8, None);
 
         let solids = doc.solid_boundary_face_ids();
         assert_eq!(solids.len(), 6, "only the box's faces are printable solids");
@@ -951,7 +1108,7 @@ mod tests {
     fn push_pull_with_zero_distance_keeps_group_and_solid_membership() {
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
-        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0))[0];
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0), None)[0];
         let box_faces = doc.push_pull(sketch_id, 1.0);
         let group_id = doc.group_faces(&box_faces, "hull".to_string());
         let cap = box_faces[0];
@@ -962,10 +1119,187 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_of_a_box_is_an_independent_manifold_copy() {
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0), None)[0];
+        let box_faces = doc.push_pull(sketch_id, 1.0);
+        assert_eq!(doc.mesh.vertices.len(), 8);
+
+        let copy_faces = doc.duplicate_faces(&box_faces, DVec3::new(5.0, 0.0, 0.0));
+
+        assert_eq!(copy_faces.len(), 6);
+        assert!(pushpull::is_manifold(&doc.mesh, &copy_faces), "duplicated box must be manifold on its own");
+        assert_eq!(
+            doc.mesh.vertices.len(),
+            16,
+            "copy must clone its own 8 distinct vertices, reusing them across its 6 faces just like the source"
+        );
+        assert_eq!(doc.solid_boundary_face_ids().len(), 12, "the copy must inherit solid-boundary status from its source faces");
+        let selected: HashSet<FaceId> = copy_faces.iter().copied().collect();
+        assert_eq!(doc.selection.faces, selected, "the copy should become the new selection");
+
+        for &vid in &doc.mesh.faces[box_faces[0]].outer {
+            let x = doc.mesh.position(vid).x;
+            assert!((0.0..=1.0).contains(&x), "duplicating must not move the source geometry, x={x}");
+        }
+    }
+
+    #[test]
+    fn mirroring_a_box_leaves_the_original_untouched_and_produces_an_outward_facing_copy() {
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::new(5.0, 5.0), DVec2::new(6.0, 6.0), None)[0];
+        let box_faces = doc.push_pull(sketch_id, 1.0);
+
+        let mirrored = doc.mirror_faces(&box_faces, MirrorAxis::X, DVec3::ZERO);
+
+        assert_eq!(mirrored.len(), 6);
+        assert!(pushpull::is_manifold(&doc.mesh, &mirrored), "mirrored copy must be manifold - winding must survive the reflection");
+
+        for &vid in &doc.mesh.faces[box_faces[0]].outer {
+            let x = doc.mesh.position(vid).x;
+            assert!((4.999..=6.001).contains(&x), "mirroring must not move the source geometry, x={x}");
+        }
+
+        let copy_points: Vec<DVec3> =
+            mirrored.iter().flat_map(|&f| doc.mesh.faces[f].outer.iter().map(|&v| doc.mesh.position(v))).collect();
+        assert!(copy_points.iter().all(|p| p.x <= -4.999), "mirrored copy should sit entirely on the opposite side of x=0");
+
+        let centroid = copy_points.iter().fold(DVec3::ZERO, |acc, &p| acc + p) / copy_points.len() as f64;
+        for &fid in &mirrored {
+            let face = &doc.mesh.faces[fid];
+            let face_centroid =
+                face.outer.iter().map(|&v| doc.mesh.position(v)).fold(DVec3::ZERO, |acc, p| acc + p) / face.outer.len() as f64;
+            assert!(face.normal.dot(face_centroid - centroid) > 0.0, "mirrored face normal should point outward from the copy");
+        }
+    }
+
+    #[test]
+    fn mirroring_a_hollow_ring_stays_manifold() {
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        doc.draw_circle(&plane, DVec2::new(10.0, 0.0), 5.0, 16, None);
+        doc.draw_circle(&plane, DVec2::new(10.0, 0.0), 2.0, 16, None);
+        let inner_id = doc.mesh.faces.iter().find(|(_, f)| f.holes.is_empty()).unwrap().0;
+        doc.erase_face(inner_id);
+        let ring_id = doc.mesh.faces.iter().next().unwrap().0;
+        let tube_faces = doc.push_pull(ring_id, 3.0);
+
+        let mirrored = doc.mirror_faces(&tube_faces, MirrorAxis::X, DVec3::ZERO);
+
+        assert!(pushpull::is_manifold(&doc.mesh, &mirrored), "mirrored hollow tube (with reversed hole loops) must stay manifold");
+    }
+
+    /// Finds the wall's own 2D bounding-box center, in the wall's own plane
+    /// coordinates - used by the draw-on-face tests below to place a small
+    /// rectangle safely inside an arbitrary axis-aligned box wall.
+    fn wall_plane_and_center(doc: &Document, wall_id: FaceId) -> (Plane, DVec2) {
+        let wall = doc.mesh.faces[wall_id].clone();
+        let wall_plane = Plane::from_normal(doc.mesh.position(wall.outer[0]), wall.normal);
+        let wall_2d: Vec<DVec2> = wall.outer.iter().map(|&v| wall_plane.to_2d(doc.mesh.position(v))).collect();
+        let min = wall_2d.iter().cloned().reduce(DVec2::min).unwrap();
+        let max = wall_2d.iter().cloned().reduce(DVec2::max).unwrap();
+        (wall_plane, (min + max) * 0.5)
+    }
+
+    #[test]
+    fn drawing_a_rectangle_on_a_solids_side_wall_splits_just_that_wall() {
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), None)[0];
+        let box_faces = doc.push_pull(sketch_id, 4.0);
+        let group_id = doc.group_faces(&box_faces, "hull".to_string());
+        let wall_id = box_faces.iter().copied().find(|&fid| doc.mesh.faces[fid].normal.z.abs() < 0.01).unwrap();
+
+        let (wall_plane, center) = wall_plane_and_center(&doc, wall_id);
+        let new_faces =
+            doc.draw_rectangle(&wall_plane, center - DVec2::new(1.0, 1.0), center + DVec2::new(1.0, 1.0), Some(wall_id));
+
+        assert_eq!(new_faces.len(), 2, "the wall should split into a framed hole + an inner panel");
+        assert_eq!(doc.mesh.faces.len(), 7, "5 untouched box faces + the wall's 2 split pieces");
+        let faces_with_holes = new_faces.iter().filter(|&&fid| !doc.mesh.faces[fid].holes.is_empty()).count();
+        assert_eq!(faces_with_holes, 1);
+        for &fid in &new_faces {
+            assert!(doc.solid_boundary_face_ids().contains(&fid), "split wall pieces must stay solid-flagged");
+            assert!(doc.groups[group_id].face_ids.contains(&fid), "split wall pieces must stay in the source wall's group");
+        }
+    }
+
+    #[test]
+    fn pushing_a_face_drawn_on_a_solid_wall_stays_manifold() {
+        // The porthole workflow end-to-end: sketch a rectangle on a wall,
+        // then push it inward to carve a recess.
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), None)[0];
+        let box_faces = doc.push_pull(sketch_id, 4.0);
+        let wall_id = box_faces.iter().copied().find(|&fid| doc.mesh.faces[fid].normal.z.abs() < 0.01).unwrap();
+
+        let (wall_plane, center) = wall_plane_and_center(&doc, wall_id);
+        let split = doc.draw_rectangle(&wall_plane, center - DVec2::new(1.0, 1.0), center + DVec2::new(1.0, 1.0), Some(wall_id));
+        let inner = *split.iter().find(|&fid| doc.mesh.faces[*fid].holes.is_empty()).unwrap();
+        doc.push_pull(inner, -0.5);
+
+        let all_faces: Vec<FaceId> = doc.mesh.faces.keys().collect();
+        assert!(pushpull::is_manifold(&doc.mesh, &all_faces), "porthole recess must keep the whole solid watertight");
+    }
+
+    #[test]
+    fn drawing_on_a_target_face_does_not_disturb_other_coplanar_sketches() {
+        // Two independent flat sketches on the ground plane (neither pushed
+        // into a solid, so resplit_plane's solid_face_ids exclusion doesn't
+        // apply to either) - confirms target_face_id routes through the
+        // LOCAL resplit_face_with_loops path, not the document-wide
+        // coplanar search resplit_plane does, which would otherwise merge
+        // both rectangles the moment either one is touched.
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), None);
+        // Drawing this second, far-away sketch resplits the WHOLE ground
+        // plane (both are plain sketches, so neither is solid_face_ids-
+        // excluded) - which erases and recreates the first rectangle's
+        // face, invalidating any id captured before this point. Look the
+        // target up fresh afterward instead - the same rule
+        // `Document::push_pull`'s stale-id tests already rely on.
+        doc.draw_rectangle(&plane, DVec2::new(20.0, 20.0), DVec2::new(21.0, 21.0), None);
+        assert_eq!(doc.mesh.faces.len(), 2);
+        let target_id = doc
+            .mesh
+            .faces
+            .iter()
+            .find(|(_, f)| doc.mesh.position(f.outer[0]).x < 15.0)
+            .map(|(id, _)| id)
+            .unwrap();
+
+        let split = doc.draw_rectangle(&plane, DVec2::new(4.0, 4.0), DVec2::new(6.0, 6.0), Some(target_id));
+
+        assert_eq!(split.len(), 2, "the targeted sketch should split into a framed hole + an inner panel");
+        assert_eq!(doc.mesh.faces.len(), 3, "the untouched second sketch must survive alongside the 2 split pieces");
+        let untouched = doc.mesh.faces.values().any(|f| {
+            f.outer.len() == 4 && f.holes.is_empty() && doc.mesh.position(f.outer[0]).x > 15.0
+        });
+        assert!(untouched, "the unrelated second sketch rectangle must be unchanged");
+    }
+
+    #[test]
+    fn drawing_with_a_stale_target_face_falls_back_to_the_plain_resplit() {
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let stale_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0), None)[0];
+        doc.erase_face(stale_id);
+
+        let new_faces = doc.draw_rectangle(&plane, DVec2::new(2.0, 2.0), DVec2::new(3.0, 3.0), Some(stale_id));
+
+        assert_eq!(new_faces.len(), 1, "a stale target must not drop the drawn shape - falls back to the plain ground-plane resplit");
+        assert_eq!(doc.mesh.faces[new_faces[0]].outer.len(), 4);
+    }
+
+    #[test]
     fn project_file_round_trip_preserves_geometry_and_groups() {
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
-        let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(2.0, 3.0))[0];
+        let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(2.0, 3.0), None)[0];
         let solid_faces = doc.push_pull(face_id, 4.0);
         let group_id = doc.group_faces(&solid_faces, "hull".to_string());
 
@@ -984,7 +1318,7 @@ mod tests {
         // unrelated shape on the ground plane must not sweep in the
         // reloaded solid's cap even though it's exactly coplanar with it.
         let face_count_before = reloaded.mesh.faces.len();
-        reloaded.draw_rectangle(&plane, DVec2::new(10.0, 10.0), DVec2::new(11.0, 11.0));
+        reloaded.draw_rectangle(&plane, DVec2::new(10.0, 10.0), DVec2::new(11.0, 11.0), None);
         assert_eq!(reloaded.mesh.faces.len(), face_count_before + 1, "reloaded solid's faces must be untouched");
     }
 
@@ -992,7 +1326,7 @@ mod tests {
     fn project_file_round_trip_preserves_vertex_positions() {
         let mut doc = Document::new();
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
-        doc.draw_rectangle(&plane, DVec2::new(1.5, -2.5), DVec2::new(4.0, 3.0));
+        doc.draw_rectangle(&plane, DVec2::new(1.5, -2.5), DVec2::new(4.0, 3.0), None);
 
         let project = doc.to_project_file();
         let reloaded = Document::from_project_file(&project);

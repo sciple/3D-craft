@@ -3,6 +3,8 @@ import { documentStore, faceIdKey } from "../state/document-store";
 import type { FaceId } from "../state/document-store";
 import type { Tool, ToolContext } from "./types";
 import { pointerToNdc } from "./types";
+import { NumericBuffer } from "./numeric-input";
+import { measurementHud } from "../ui/measurement-hud";
 
 const MIN_SCALE = 0.02;
 
@@ -13,7 +15,8 @@ const MIN_SCALE = 0.02;
 /// on-screen position) rather than a 3D axis, since unlike Push/Pull there
 /// is no single natural drag axis for a uniform scale; this mirrors how
 /// SketchUp's own Scale handles read as "drag the corner toward/away from
-/// the center."
+/// the center." A typed number while dragging overrides the scale factor
+/// directly (e.g. "2" doubles, "0.5" halves).
 export class ScaleTool implements Tool {
   readonly name = "scale";
 
@@ -24,6 +27,7 @@ export class ScaleTool implements Tool {
   private pivotScreenPx = new THREE.Vector2();
   private startDistancePx = 0;
   private currentScale = 1;
+  private numeric = new NumericBuffer();
 
   private previewMesh: THREE.Mesh | null = null;
   private previewEdges: THREE.LineSegments | null = null;
@@ -62,6 +66,7 @@ export class ScaleTool implements Tool {
     this.startDistancePx = Math.max(1, this.pivotScreenPx.distanceTo(new THREE.Vector2(e.clientX, e.clientY)));
 
     this.currentScale = 1;
+    this.numeric.clear();
     this.dragging = true;
     this.buildPreview(ctx, this.targetFaceIds);
   }
@@ -77,7 +82,7 @@ export class ScaleTool implements Tool {
     if (!this.dragging) return;
     this.dragging = false;
     const faceIds = this.targetFaceIds;
-    const scale = this.currentScale;
+    const scale = this.effectiveScale();
     this.targetFaceIds = [];
     this.clearPreview();
     if (faceIds.length > 0 && Math.abs(scale - 1) > 1e-4) {
@@ -86,6 +91,21 @@ export class ScaleTool implements Tool {
   }
 
   onKeyDown(e: KeyboardEvent) {
+    if (this.dragging) {
+      if (e.key === "Enter") {
+        if (!this.numeric.isEmpty) void this.onPointerUp();
+        return;
+      }
+      if (e.key === "Escape" && !this.numeric.isEmpty) {
+        this.numeric.clear();
+        this.updatePreviewPositions();
+        return;
+      }
+      if (this.numeric.type(e)) {
+        this.updatePreviewPositions();
+        return;
+      }
+    }
     if (e.key === "Escape" && this.dragging) {
       this.dragging = false;
       this.targetFaceIds = [];
@@ -97,6 +117,12 @@ export class ScaleTool implements Tool {
     this.dragging = false;
     this.targetFaceIds = [];
     this.clearPreview();
+  }
+
+  private effectiveScale(): number {
+    if (this.numeric.isEmpty) return this.currentScale;
+    const v = this.numeric.values()[0];
+    return v === undefined ? this.currentScale : Math.max(MIN_SCALE, Math.abs(v));
   }
 
   private buildPreview(ctx: ToolContext, faceIds: FaceId[]) {
@@ -157,12 +183,13 @@ export class ScaleTool implements Tool {
 
   private updatePreviewPositions() {
     if (!this.previewMesh || !this.previewEdges || !this.basePositions) return;
+    const scale = this.effectiveScale();
     const n = this.basePositions.length;
     const out = new Float32Array(n);
     for (let i = 0; i < n; i += 3) {
-      out[i] = this.pivot.x + (this.basePositions[i] - this.pivot.x) * this.currentScale;
-      out[i + 1] = this.pivot.y + (this.basePositions[i + 1] - this.pivot.y) * this.currentScale;
-      out[i + 2] = this.pivot.z + (this.basePositions[i + 2] - this.pivot.z) * this.currentScale;
+      out[i] = this.pivot.x + (this.basePositions[i] - this.pivot.x) * scale;
+      out[i + 1] = this.pivot.y + (this.basePositions[i + 1] - this.pivot.y) * scale;
+      out[i + 2] = this.pivot.z + (this.basePositions[i + 2] - this.pivot.z) * scale;
     }
     for (const geometry of [this.previewMesh.geometry, this.previewEdges.geometry]) {
       const attr = geometry.getAttribute("position") as THREE.BufferAttribute;
@@ -171,6 +198,7 @@ export class ScaleTool implements Tool {
       geometry.computeBoundingSphere();
     }
     this.previewMesh.geometry.computeVertexNormals();
+    measurementHud.show("Scale", `${scale.toFixed(2)}×`, this.numeric.isEmpty ? null : this.numeric.display);
   }
 
   private clearPreview() {
@@ -187,5 +215,7 @@ export class ScaleTool implements Tool {
       this.previewEdges = null;
     }
     this.basePositions = null;
+    this.numeric.clear();
+    measurementHud.hide();
   }
 }

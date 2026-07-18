@@ -8,7 +8,7 @@ use crate::geometry::plane::Plane;
 use crate::geometry::pushpull;
 use crate::io::project_file::ProjectFile;
 use crate::io::stl_export;
-use crate::scene::document::{Document, DocumentSnapshot, GroupId};
+use crate::scene::document::{Document, DocumentSnapshot, GroupId, MirrorAxis};
 
 /// How many undo steps to retain. Documents at this app's scale (a
 /// spaceship part, not a large assembly) are small enough that cloning the
@@ -87,11 +87,12 @@ pub fn draw_rectangle(
     plane_normal: DVec3,
     corner_a: DVec2,
     corner_b: DVec2,
+    target_face_id: Option<FaceId>,
 ) -> DocumentSnapshot {
     let mut history = state.0.lock().unwrap();
     history.record();
     let plane = Plane::from_normal(plane_origin, plane_normal);
-    history.document.draw_rectangle(&plane, corner_a, corner_b);
+    history.document.draw_rectangle(&plane, corner_a, corner_b, target_face_id);
     history.document.snapshot()
 }
 
@@ -103,11 +104,12 @@ pub fn draw_circle(
     center: DVec2,
     radius: f64,
     segments: u32,
+    target_face_id: Option<FaceId>,
 ) -> DocumentSnapshot {
     let mut history = state.0.lock().unwrap();
     history.record();
     let plane = Plane::from_normal(plane_origin, plane_normal);
-    history.document.draw_circle(&plane, center, radius, segments as usize);
+    history.document.draw_circle(&plane, center, radius, segments as usize, target_face_id);
     history.document.snapshot()
 }
 
@@ -117,11 +119,12 @@ pub fn draw_polygon(
     plane_origin: DVec3,
     plane_normal: DVec3,
     points: Vec<DVec2>,
+    target_face_id: Option<FaceId>,
 ) -> DocumentSnapshot {
     let mut history = state.0.lock().unwrap();
     history.record();
     let plane = Plane::from_normal(plane_origin, plane_normal);
-    history.document.draw_polygon(&plane, points);
+    history.document.draw_polygon(&plane, points, target_face_id);
     history.document.snapshot()
 }
 
@@ -184,6 +187,27 @@ pub fn scale_faces(state: State<AppState>, face_ids: Vec<FaceId>, pivot: DVec3, 
     let mut history = state.0.lock().unwrap();
     history.record();
     history.document.scale_faces(&face_ids, pivot, scale);
+    history.document.snapshot()
+}
+
+#[tauri::command]
+pub fn duplicate_faces(state: State<AppState>, face_ids: Vec<FaceId>, delta: DVec3) -> DocumentSnapshot {
+    let mut history = state.0.lock().unwrap();
+    history.record();
+    history.document.duplicate_faces(&face_ids, delta);
+    history.document.snapshot()
+}
+
+#[tauri::command]
+pub fn mirror_faces(
+    state: State<AppState>,
+    face_ids: Vec<FaceId>,
+    axis: MirrorAxis,
+    pivot: DVec3,
+) -> DocumentSnapshot {
+    let mut history = state.0.lock().unwrap();
+    history.record();
+    history.document.mirror_faces(&face_ids, axis, pivot);
     history.document.snapshot()
 }
 
@@ -285,7 +309,7 @@ mod tests {
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
 
         history.record();
-        history.document.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0));
+        history.document.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0), None);
         assert_eq!(history.document.mesh.faces.len(), 1);
 
         history.undo();
@@ -298,7 +322,7 @@ mod tests {
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
 
         history.record();
-        history.document.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0));
+        history.document.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0), None);
         history.undo();
         assert_eq!(history.document.mesh.faces.len(), 0);
 
@@ -312,11 +336,11 @@ mod tests {
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
 
         history.record();
-        history.document.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0));
+        history.document.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0), None);
         history.undo();
 
         history.record();
-        history.document.draw_circle(&plane, DVec2::new(5.0, 5.0), 1.0, 8);
+        history.document.draw_circle(&plane, DVec2::new(5.0, 5.0), 1.0, 8, None);
         assert!(history.redo_stack.is_empty());
         assert_eq!(history.document.mesh.faces.len(), 1);
     }
@@ -335,7 +359,7 @@ mod tests {
         let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
         for _ in 0..(MAX_UNDO_STEPS + 10) {
             history.record();
-            history.document.draw_circle(&plane, DVec2::ZERO, 1.0, 8);
+            history.document.draw_circle(&plane, DVec2::ZERO, 1.0, 8, None);
         }
         assert_eq!(history.undo_stack.len(), MAX_UNDO_STEPS);
     }

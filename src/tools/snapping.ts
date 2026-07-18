@@ -2,7 +2,9 @@ import * as THREE from "three";
 import { documentStore } from "../state/document-store";
 import type { DocumentSnapshot } from "../state/document-store";
 import type { ToolContext } from "./types";
-import { raycastGroundPlane } from "./types";
+import { pointerToNdc } from "./types";
+import type { SketchPlane } from "./plane";
+import { toThreePlane } from "./plane";
 
 export type SnapKind = "endpoint" | "midpoint" | "edge";
 
@@ -12,34 +14,37 @@ export interface SnapResult {
 }
 
 const SNAP_PIXELS = 12;
-const GROUND_EPS = 1e-4;
+const PLANE_EPS = 1e-4;
 
 /// Finds the nearest snap candidate among vertices/edges of existing
-/// geometry that lie on the ground plane (Z=0) - the only plane the v1 draw
-/// tools draw on - within a tolerance sized in world units to read as a
-/// constant ~12px on screen regardless of zoom. Priority matches SketchUp's
-/// inference order: an endpoint within tolerance always wins over a
-/// midpoint or edge point even if the midpoint/edge point is numerically
-/// closer to the cursor, since endpoints are the more useful target.
-export function findGroundSnap(
+/// geometry that lie on `plane` (the sketch plane the active draw tool is
+/// currently working on - the ground plane by default, or a solid face's
+/// own plane when drawing directly on top of it) within a tolerance sized
+/// in world units to read as a constant ~12px on screen regardless of zoom.
+/// Priority matches SketchUp's inference order: an endpoint within
+/// tolerance always wins over a midpoint or edge point even if the
+/// midpoint/edge point is numerically closer to the cursor, since endpoints
+/// are the more useful target.
+export function findPlanarSnap(
   snapshot: DocumentSnapshot,
-  groundPoint: THREE.Vector3,
+  planePoint: THREE.Vector3,
+  plane: SketchPlane,
   camera: THREE.PerspectiveCamera,
   domElement: HTMLElement,
 ): SnapResult | null {
   const rect = domElement.getBoundingClientRect();
-  const distance = Math.max(0.001, camera.position.distanceTo(groundPoint));
+  const distance = Math.max(0.001, camera.position.distanceTo(planePoint));
   const worldPerPixel = (2 * distance * Math.tan((camera.fov * Math.PI) / 360)) / rect.height;
   const tolerance = SNAP_PIXELS * worldPerPixel;
 
-  const onPlane = (i: number) => Math.abs(snapshot.vertices[i][2]) < GROUND_EPS;
   const positionOf = (i: number) => new THREE.Vector3(...snapshot.vertices[i]);
+  const onPlane = (i: number) => Math.abs(positionOf(i).sub(plane.origin).dot(plane.normal)) < PLANE_EPS;
 
   const nearestWithin = (points: THREE.Vector3[], kind: SnapKind): SnapResult | null => {
     let best: SnapResult | null = null;
     let bestDist = tolerance;
     for (const p of points) {
-      const d = p.distanceTo(groundPoint);
+      const d = p.distanceTo(planePoint);
       if (d < bestDist) {
         bestDist = d;
         best = { point: p, kind };
@@ -66,7 +71,7 @@ export function findGroundSnap(
         const pa = positionOf(a);
         const pb = positionOf(b);
         midpoints.push(pa.clone().add(pb).multiplyScalar(0.5));
-        edgePoints.push(closestPointOnSegment(groundPoint, pa, pb));
+        edgePoints.push(closestPointOnSegment(planePoint, pa, pb));
       }
     }
   }
@@ -84,17 +89,21 @@ function closestPointOnSegment(p: THREE.Vector3, a: THREE.Vector3, b: THREE.Vect
   return a.clone().addScaledVector(ab, t);
 }
 
-/// Combines `raycastGroundPlane` with `findGroundSnap` - the one call draw
-/// tools need on every pointer event. Falls back to the raw raycast point
-/// when nothing is within snap tolerance.
-export function raycastGroundPlaneSnapped(
+/// Combines a raycast against `plane` with `findPlanarSnap` - the one call
+/// draw tools need on every pointer event once a sketch plane is locked in.
+/// Falls back to the raw raycast point when nothing is within snap
+/// tolerance.
+export function raycastPlaneSnapped(
   e: PointerEvent,
   ctx: ToolContext,
   raycaster: THREE.Raycaster,
+  plane: SketchPlane,
 ): { point: THREE.Vector3; snap: SnapResult | null } | null {
-  const raw = raycastGroundPlane(e, ctx, raycaster);
-  if (!raw) return null;
-  const snap = findGroundSnap(documentStore.getSnapshot(), raw, ctx.camera, ctx.domElement);
+  const ndc = pointerToNdc(e, ctx.domElement);
+  raycaster.setFromCamera(ndc, ctx.camera);
+  const raw = new THREE.Vector3();
+  if (!raycaster.ray.intersectPlane(toThreePlane(plane), raw)) return null;
+  const snap = findPlanarSnap(documentStore.getSnapshot(), raw, plane, ctx.camera, ctx.domElement);
   return { point: snap ? snap.point : raw, snap };
 }
 

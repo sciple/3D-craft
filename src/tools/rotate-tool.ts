@@ -3,12 +3,16 @@ import { documentStore, faceIdKey } from "../state/document-store";
 import type { FaceId } from "../state/document-store";
 import type { Tool, ToolContext } from "./types";
 import { pointerToNdc } from "./types";
+import { NumericBuffer } from "./numeric-input";
+import { measurementHud } from "../ui/measurement-hud";
 
 /// Click a face (or, if it's part of the current selection, every selected
 /// face) and drag in a circle to rotate it about a vertical (world Z) axis
 /// through the group's centroid - the one rotation a workbench layout
 /// actually needs most (turning a wing or hull segment to face the right
-/// way), rather than a full 3-axis trackball gizmo.
+/// way), rather than a full 3-axis trackball gizmo. A typed number of
+/// degrees while dragging overrides the angle (magnitude only - sign
+/// follows the current drag direction; an explicit "-" forces it).
 export class RotateTool implements Tool {
   readonly name = "rotate";
 
@@ -19,6 +23,7 @@ export class RotateTool implements Tool {
   private rotationPlane = new THREE.Plane();
   private startAngle = 0;
   private currentAngle = 0;
+  private numeric = new NumericBuffer();
 
   private previewMesh: THREE.Mesh | null = null;
   private previewEdges: THREE.LineSegments | null = null;
@@ -54,6 +59,7 @@ export class RotateTool implements Tool {
 
     this.startAngle = this.angleAt(hit.point);
     this.currentAngle = this.startAngle;
+    this.numeric.clear();
     this.dragging = true;
     this.buildPreview(ctx, this.targetFaceIds);
   }
@@ -72,7 +78,7 @@ export class RotateTool implements Tool {
     if (!this.dragging) return;
     this.dragging = false;
     const faceIds = this.targetFaceIds;
-    const angle = this.currentAngle - this.startAngle;
+    const angle = this.effectiveAngle();
     this.targetFaceIds = [];
     this.clearPreview();
     if (faceIds.length > 0 && Math.abs(angle) > 1e-4) {
@@ -81,6 +87,21 @@ export class RotateTool implements Tool {
   }
 
   onKeyDown(e: KeyboardEvent) {
+    if (this.dragging) {
+      if (e.key === "Enter") {
+        if (!this.numeric.isEmpty) void this.onPointerUp();
+        return;
+      }
+      if (e.key === "Escape" && !this.numeric.isEmpty) {
+        this.numeric.clear();
+        this.updatePreviewPositions();
+        return;
+      }
+      if (this.numeric.type(e)) {
+        this.updatePreviewPositions();
+        return;
+      }
+    }
     if (e.key === "Escape" && this.dragging) {
       this.dragging = false;
       this.targetFaceIds = [];
@@ -96,6 +117,19 @@ export class RotateTool implements Tool {
 
   private angleAt(point: THREE.Vector3): number {
     return Math.atan2(point.y - this.pivot.y, point.x - this.pivot.x);
+  }
+
+  /// The typed buffer holds degrees (more natural to type than radians);
+  /// converted to radians here, the sole point where the drag's radian
+  /// angle and a typed override reconcile into one effective value.
+  private effectiveAngle(): number {
+    const dragAngle = this.currentAngle - this.startAngle;
+    if (this.numeric.isEmpty) return dragAngle;
+    const v = this.numeric.values()[0];
+    if (v === undefined) return dragAngle;
+    const magnitudeRad = THREE.MathUtils.degToRad(Math.abs(v));
+    if (this.numeric.display.includes("-")) return -magnitudeRad;
+    return dragAngle < 0 ? -magnitudeRad : magnitudeRad;
   }
 
   private buildPreview(ctx: ToolContext, faceIds: FaceId[]) {
@@ -156,7 +190,7 @@ export class RotateTool implements Tool {
 
   private updatePreviewPositions() {
     if (!this.previewMesh || !this.previewEdges || !this.basePositions) return;
-    const angle = this.currentAngle - this.startAngle;
+    const angle = this.effectiveAngle();
     const cos = Math.cos(angle);
     const sin = Math.sin(angle);
     const n = this.basePositions.length;
@@ -175,6 +209,7 @@ export class RotateTool implements Tool {
       geometry.computeBoundingSphere();
     }
     this.previewMesh.geometry.computeVertexNormals();
+    measurementHud.show("Rotate", `${THREE.MathUtils.radToDeg(angle).toFixed(1)}°`, this.numeric.isEmpty ? null : this.numeric.display);
   }
 
   private clearPreview() {
@@ -191,5 +226,7 @@ export class RotateTool implements Tool {
       this.previewEdges = null;
     }
     this.basePositions = null;
+    this.numeric.clear();
+    measurementHud.hide();
   }
 }

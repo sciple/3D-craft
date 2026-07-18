@@ -96,7 +96,12 @@ class DocumentStore {
     });
   }
 
-  drawRectangle(planeOrigin: Vec3, planeNormal: Vec3, cornerA: Vec2, cornerB: Vec2) {
+  /// `targetFaceId`: when the sketch was drawn directly on top of an
+  /// existing solid face (see `tools/plane.ts`'s `resolveSketchTarget`),
+  /// the new loop splits just that face instead of triggering a
+  /// document-wide coplanar resplit - see `Document::resplit` on the Rust
+  /// side.
+  drawRectangle(planeOrigin: Vec3, planeNormal: Vec3, cornerA: Vec2, cornerB: Vec2, targetFaceId?: FaceId) {
     return this.enqueue(async () => {
       this.apply(
         await invoke<DocumentSnapshot>("draw_rectangle", {
@@ -104,12 +109,13 @@ class DocumentStore {
           planeNormal,
           cornerA,
           cornerB,
+          targetFaceId: targetFaceId ?? null,
         }),
       );
     });
   }
 
-  drawCircle(planeOrigin: Vec3, planeNormal: Vec3, center: Vec2, radius: number, segments: number) {
+  drawCircle(planeOrigin: Vec3, planeNormal: Vec3, center: Vec2, radius: number, segments: number, targetFaceId?: FaceId) {
     return this.enqueue(async () => {
       this.apply(
         await invoke<DocumentSnapshot>("draw_circle", {
@@ -118,14 +124,22 @@ class DocumentStore {
           center,
           radius,
           segments,
+          targetFaceId: targetFaceId ?? null,
         }),
       );
     });
   }
 
-  drawPolygon(planeOrigin: Vec3, planeNormal: Vec3, points: Vec2[]) {
+  drawPolygon(planeOrigin: Vec3, planeNormal: Vec3, points: Vec2[], targetFaceId?: FaceId) {
     return this.enqueue(async () => {
-      this.apply(await invoke<DocumentSnapshot>("draw_polygon", { planeOrigin, planeNormal, points }));
+      this.apply(
+        await invoke<DocumentSnapshot>("draw_polygon", {
+          planeOrigin,
+          planeNormal,
+          points,
+          targetFaceId: targetFaceId ?? null,
+        }),
+      );
     });
   }
 
@@ -168,6 +182,21 @@ class DocumentStore {
   scaleFaces(faceIds: FaceId[], pivot: Vec3, scale: Vec3) {
     return this.enqueue(async () => {
       this.apply(await invoke<DocumentSnapshot>("scale_faces", { faceIds, pivot, scale }));
+    });
+  }
+
+  duplicateFaces(faceIds: FaceId[], delta: Vec3) {
+    return this.enqueue(async () => {
+      this.apply(await invoke<DocumentSnapshot>("duplicate_faces", { faceIds, delta }));
+    });
+  }
+
+  /// Mirrors a *copy* of `faceIds` across the world plane perpendicular to
+  /// `axis` through `pivot` - the source geometry is left untouched. See
+  /// `Document::mirror_faces` for why a copy (matches SketchUp's Mirror).
+  mirrorFaces(faceIds: FaceId[], axis: "x" | "y" | "z", pivot: Vec3) {
+    return this.enqueue(async () => {
+      this.apply(await invoke<DocumentSnapshot>("mirror_faces", { faceIds, axis, pivot }));
     });
   }
 

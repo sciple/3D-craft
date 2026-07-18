@@ -4,6 +4,8 @@ import type { FaceId } from "../state/document-store";
 import type { Tool, ToolContext } from "./types";
 import { pointerToNdc } from "./types";
 import { closestDistanceAlongAxis } from "./axis-drag";
+import { NumericBuffer } from "./numeric-input";
+import { measurementHud } from "../ui/measurement-hud";
 
 type AxisName = "x" | "y" | "z";
 
@@ -52,6 +54,7 @@ export class MoveTool implements Tool {
   private previewEdges: THREE.LineSegments | null = null;
   private basePositions: Float32Array | null = null;
   private guideLine: THREE.Line | null = null;
+  private numeric = new NumericBuffer();
 
   onPointerDown(e: PointerEvent, ctx: ToolContext) {
     if (e.button !== 0) return;
@@ -71,6 +74,7 @@ export class MoveTool implements Tool {
     this.startPoint.copy(hit.point);
     this.startScreenY = e.clientY;
     this.currentDelta.set(0, 0, 0);
+    this.numeric.clear();
     this.dragging = true;
     this.buildPreview(ctx, this.targetFaceIds);
     this.updateGuideLine(ctx);
@@ -115,7 +119,7 @@ export class MoveTool implements Tool {
     if (!this.dragging) return;
     this.dragging = false;
     const faceIds = this.targetFaceIds;
-    const delta = this.currentDelta.clone();
+    const delta = this.effectiveDelta();
     this.targetFaceIds = [];
     this.clearPreview();
     if (faceIds.length > 0 && delta.length() > 1e-6) {
@@ -125,6 +129,10 @@ export class MoveTool implements Tool {
 
   onKeyDown(e: KeyboardEvent, ctx: ToolContext) {
     const key = e.key.toLowerCase();
+    // Axis-lock keys take priority over numeric typing (checked first, and
+    // NumericBuffer never sees them) since 'x' would otherwise also read as
+    // a valid buffer character (a "WxH"-style separator, unused by Move but
+    // shared code with the draw tools).
     if ((key === "x" || key === "y" || key === "z") && !e.ctrlKey && !e.metaKey && !e.altKey) {
       this.axisLock = this.axisLock === key ? null : key;
       this.updateGuideLine(ctx);
@@ -135,11 +143,49 @@ export class MoveTool implements Tool {
       }
       return;
     }
+
+    if (this.dragging) {
+      if (e.key === "Enter") {
+        if (!this.numeric.isEmpty) void this.onPointerUp();
+        return;
+      }
+      if (e.key === "Escape" && !this.numeric.isEmpty) {
+        this.numeric.clear();
+        this.updatePreviewPositions();
+        return;
+      }
+      if (this.numeric.type(e)) {
+        this.updatePreviewPositions();
+        return;
+      }
+    }
+
     if (e.key === "Escape" && this.dragging) {
       this.dragging = false;
       this.targetFaceIds = [];
       this.clearPreview();
     }
+  }
+
+  /// A typed magnitude scales along the current delta's own direction (so
+  /// it respects an active axis lock automatically, since the locked
+  /// delta already only ever points along that axis) rather than a fixed
+  /// world axis - typing "5" keeps whichever direction is currently being
+  /// dragged; an explicit "-" flips it. Falls back to the locked axis (or,
+  /// with no lock and no drag yet, the raw delta) when there's no
+  /// established direction to scale along yet.
+  private effectiveDelta(): THREE.Vector3 {
+    if (this.numeric.isEmpty) return this.currentDelta.clone();
+    const v = this.numeric.values()[0];
+    if (v === undefined) return this.currentDelta.clone();
+    const magnitude = this.numeric.display.includes("-") ? v : Math.abs(v);
+    if (this.currentDelta.lengthSq() > 1e-12) {
+      return this.currentDelta.clone().normalize().multiplyScalar(magnitude);
+    }
+    if (this.axisLock) {
+      return AXIS_VECTORS[this.axisLock].clone().multiplyScalar(magnitude);
+    }
+    return this.currentDelta.clone();
   }
 
   deactivate() {
@@ -207,12 +253,13 @@ export class MoveTool implements Tool {
 
   private updatePreviewPositions() {
     if (!this.previewMesh || !this.previewEdges || !this.basePositions) return;
+    const delta = this.effectiveDelta();
     const n = this.basePositions.length;
     const out = new Float32Array(n);
     for (let i = 0; i < n; i += 3) {
-      out[i] = this.basePositions[i] + this.currentDelta.x;
-      out[i + 1] = this.basePositions[i + 1] + this.currentDelta.y;
-      out[i + 2] = this.basePositions[i + 2] + this.currentDelta.z;
+      out[i] = this.basePositions[i] + delta.x;
+      out[i + 1] = this.basePositions[i + 1] + delta.y;
+      out[i + 2] = this.basePositions[i + 2] + delta.z;
     }
     for (const geometry of [this.previewMesh.geometry, this.previewEdges.geometry]) {
       const attr = geometry.getAttribute("position") as THREE.BufferAttribute;
@@ -220,6 +267,7 @@ export class MoveTool implements Tool {
       attr.needsUpdate = true;
       geometry.computeBoundingSphere();
     }
+    measurementHud.show("Move", `${delta.length().toFixed(1)} mm`, this.numeric.isEmpty ? null : this.numeric.display);
   }
 
   /// Shows an axis-colored line through the grab point along the locked
@@ -264,5 +312,7 @@ export class MoveTool implements Tool {
     }
     this.basePositions = null;
     this.removeGuideLine();
+    this.numeric.clear();
+    measurementHud.hide();
   }
 }

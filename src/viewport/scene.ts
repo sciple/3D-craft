@@ -27,10 +27,13 @@ export function initViewport(container: HTMLElement) {
   dirLight.position.set(5, -8, 10);
   scene.add(dirLight);
 
-  const grid = new THREE.GridHelper(20, 20, 0x556677, 0x3a4552);
+  // 1 unit = 1 mm throughout this app (STL/slicers assume mm, and it keeps
+  // export unit-conversion-free) - a 100x100mm grid in 5mm cells reads as a
+  // sensible default print-bed-scale reference for small spacecraft parts.
+  const grid = new THREE.GridHelper(100, 20, 0x556677, 0x3a4552);
   grid.rotation.x = Math.PI / 2; // GridHelper defaults to the XZ plane; rotate into XY (our ground plane)
   scene.add(grid);
-  scene.add(new THREE.AxesHelper(2)); // red=X, green=Y, blue=Z, matching SketchUp's axis colors
+  scene.add(new THREE.AxesHelper(10)); // red=X, green=Y, blue=Z, matching SketchUp's axis colors
 
   window.addEventListener("resize", () => {
     camera.aspect = container.clientWidth / container.clientHeight;

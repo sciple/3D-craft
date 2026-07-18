@@ -5,6 +5,8 @@ import type { Tool, ToolContext } from "./types";
 import { pointerToNdc } from "./types";
 import { offsetPolygon2D } from "../geometry/inset-2d";
 import { closestDistanceAlongAxis } from "./axis-drag";
+import { NumericBuffer } from "./numeric-input";
+import { measurementHud } from "../ui/measurement-hud";
 
 /// Click a face, then drag toward its center to inset it by a variable
 /// amount - releasing commits an `inset_face` call, which splits the face
@@ -12,7 +14,8 @@ import { closestDistanceAlongAxis } from "./axis-drag";
 /// SketchUp, minus the separate duplicate-and-erase steps). Dragging away
 /// from the center is clamped to zero: this tool only shrinks: growing a
 /// face outward isn't a meaningful "inset" and the ring/erase workflow
-/// already covers building things the other way around.
+/// already covers building things the other way around. A typed number
+/// while dragging overrides the offset.
 export class InsetTool implements Tool {
   readonly name = "inset";
 
@@ -22,6 +25,7 @@ export class InsetTool implements Tool {
   private axisOrigin = new THREE.Vector3();
   private axisDir = new THREE.Vector3();
   private currentOffset = 0;
+  private numeric = new NumericBuffer();
 
   private basis: { origin: THREE.Vector3; u: THREE.Vector3; v: THREE.Vector3 } | null = null;
   private outer2d: THREE.Vector2[] = [];
@@ -58,6 +62,7 @@ export class InsetTool implements Tool {
     this.axisOrigin.copy(hit.point);
     this.axisDir.copy(centroid).sub(hit.point).normalize();
     this.currentOffset = 0;
+    this.numeric.clear();
     this.dragging = true;
     this.updatePreview(ctx);
   }
@@ -80,7 +85,7 @@ export class InsetTool implements Tool {
     if (!this.dragging) return;
     this.dragging = false;
     const faceId = this.faceId;
-    const offset = this.currentOffset;
+    const offset = this.effectiveOffset();
     this.faceId = null;
     this.clearPreview();
     if (faceId && offset > 1e-6) {
@@ -88,7 +93,22 @@ export class InsetTool implements Tool {
     }
   }
 
-  onKeyDown(e: KeyboardEvent) {
+  onKeyDown(e: KeyboardEvent, ctx: ToolContext) {
+    if (this.dragging) {
+      if (e.key === "Enter") {
+        if (!this.numeric.isEmpty) void this.onPointerUp();
+        return;
+      }
+      if (e.key === "Escape" && !this.numeric.isEmpty) {
+        this.numeric.clear();
+        this.updatePreview(ctx);
+        return;
+      }
+      if (this.numeric.type(e)) {
+        this.updatePreview(ctx);
+        return;
+      }
+    }
     if (e.key === "Escape" && this.dragging) {
       this.dragging = false;
       this.faceId = null;
@@ -100,6 +120,12 @@ export class InsetTool implements Tool {
     this.dragging = false;
     this.faceId = null;
     this.clearPreview();
+  }
+
+  private effectiveOffset(): number {
+    if (this.numeric.isEmpty) return this.currentOffset;
+    const v = this.numeric.values()[0];
+    return v === undefined ? this.currentOffset : Math.max(0, Math.abs(v));
   }
 
   private to2d(p: THREE.Vector3): THREE.Vector2 {
@@ -117,7 +143,8 @@ export class InsetTool implements Tool {
   }
 
   private updatePreview(ctx: ToolContext) {
-    const inset2d = offsetPolygon2D(this.outer2d, this.currentOffset);
+    const offset = this.effectiveOffset();
+    const inset2d = offsetPolygon2D(this.outer2d, offset);
     if (!inset2d) return; // offset too large for this shape - keep showing the last valid loop
     const points = [...inset2d, inset2d[0]].map((p) => this.to3d(p));
     const geometry = new THREE.BufferGeometry().setFromPoints(points);
@@ -128,13 +155,17 @@ export class InsetTool implements Tool {
       this.preview.geometry.dispose();
       this.preview.geometry = geometry;
     }
+    measurementHud.show("Inset", `${offset.toFixed(1)} mm`, this.numeric.isEmpty ? null : this.numeric.display);
   }
 
   private clearPreview() {
-    if (!this.preview) return;
-    this.preview.parent?.remove(this.preview);
-    this.preview.geometry.dispose();
-    (this.preview.material as THREE.Material).dispose();
-    this.preview = null;
+    if (this.preview) {
+      this.preview.parent?.remove(this.preview);
+      this.preview.geometry.dispose();
+      (this.preview.material as THREE.Material).dispose();
+      this.preview = null;
+    }
+    this.numeric.clear();
+    measurementHud.hide();
   }
 }
