@@ -6,13 +6,34 @@ import { pointerToNdc } from "./types";
 import { NumericBuffer } from "./numeric-input";
 import { measurementHud } from "../ui/measurement-hud";
 
+type AxisName = "x" | "y" | "z";
+
+const AXIS_VECTORS: Record<AxisName, THREE.Vector3> = {
+  x: new THREE.Vector3(1, 0, 0),
+  y: new THREE.Vector3(0, 1, 0),
+  z: new THREE.Vector3(0, 0, 1),
+};
+
+// SketchUp's axis colors: red X, green Y, blue Z - shown on the spin-axis
+// guide line so the active rotation axis is visible at a glance.
+const AXIS_COLORS: Record<AxisName, number> = {
+  x: 0xff3b30,
+  y: 0x34c759,
+  z: 0x3a7bff,
+};
+
+const GUIDE_LENGTH = 1000;
+
 /// Click a face (or, if it's part of the current selection, every selected
-/// face) and drag in a circle to rotate it about a vertical (world Z) axis
-/// through the group's centroid - the one rotation a workbench layout
-/// actually needs most (turning a wing or hull segment to face the right
-/// way), rather than a full 3-axis trackball gizmo. A typed number of
-/// degrees while dragging overrides the angle (magnitude only - sign
-/// follows the current drag direction; an explicit "-" forces it).
+/// face) and drag in a circle to rotate it about the spin axis through the
+/// group's centroid. The axis defaults to vertical (world Z - the common
+/// case of turning a part on the workbench); pressing X, Y, or Z (before or
+/// during a drag) switches the spin axis to that world axis, with an
+/// axis-colored guide line through the pivot showing which axis is active.
+/// The axis choice persists across drags until changed or the tool is
+/// switched. A typed number of degrees while dragging overrides the angle
+/// (magnitude only - sign follows the current drag direction; an explicit
+/// "-" forces it).
 export class RotateTool implements Tool {
   readonly name = "rotate";
 
@@ -20,14 +41,23 @@ export class RotateTool implements Tool {
   private dragging = false;
   private targetFaceIds: FaceId[] = [];
   private pivot = new THREE.Vector3();
+  private axis: AxisName = "z";
+  // Orthonormal basis (u, v) spanning the plane perpendicular to the spin
+  // axis, right-handed about it (v = axis x u), so angleAt measures a
+  // right-handed angle that matches the backend's from_axis_angle winding.
+  private basisU = new THREE.Vector3(1, 0, 0);
+  private basisV = new THREE.Vector3(0, 1, 0);
   private rotationPlane = new THREE.Plane();
+  private startPoint = new THREE.Vector3();
   private startAngle = 0;
   private currentAngle = 0;
+  private lastMoveEvent: PointerEvent | null = null;
   private numeric = new NumericBuffer();
 
   private previewMesh: THREE.Mesh | null = null;
   private previewEdges: THREE.LineSegments | null = null;
   private basePositions: Float32Array | null = null;
+  private guideLine: THREE.Line | null = null;
 
   onPointerDown(e: PointerEvent, ctx: ToolContext) {
     if (e.button !== 0) return;
@@ -55,17 +85,25 @@ export class RotateTool implements Tool {
     }
     if (points.length === 0) return;
     this.pivot = points.reduce((sum, p) => sum.add(p), new THREE.Vector3()).divideScalar(points.length);
-    this.rotationPlane.setFromNormalAndCoplanarPoint(new THREE.Vector3(0, 0, 1), this.pivot);
+    this.updateBasis();
 
-    this.startAngle = this.angleAt(hit.point);
+    this.startPoint.copy(hit.point);
+    this.startAngle = this.angleAt(this.startPoint);
     this.currentAngle = this.startAngle;
+    this.lastMoveEvent = null;
     this.numeric.clear();
     this.dragging = true;
     this.buildPreview(ctx, this.targetFaceIds);
+    this.updateGuideLine(ctx);
   }
 
   onPointerMove(e: PointerEvent, ctx: ToolContext) {
     if (!this.dragging) return;
+    this.lastMoveEvent = e;
+    this.applyPointerAngle(e, ctx);
+  }
+
+  private applyPointerAngle(e: PointerEvent, ctx: ToolContext) {
     const ndc = pointerToNdc(e, ctx.domElement);
     this.raycaster.setFromCamera(ndc, ctx.camera);
     const point = new THREE.Vector3();
@@ -79,14 +117,39 @@ export class RotateTool implements Tool {
     this.dragging = false;
     const faceIds = this.targetFaceIds;
     const angle = this.effectiveAngle();
+    const axis = AXIS_VECTORS[this.axis];
     this.targetFaceIds = [];
     this.clearPreview();
     if (faceIds.length > 0 && Math.abs(angle) > 1e-4) {
-      await documentStore.rotateFaces(faceIds, [this.pivot.x, this.pivot.y, this.pivot.z], [0, 0, 1], angle);
+      await documentStore.rotateFaces(faceIds, [this.pivot.x, this.pivot.y, this.pivot.z], [axis.x, axis.y, axis.z], angle);
     }
   }
 
-  onKeyDown(e: KeyboardEvent) {
+  onKeyDown(e: KeyboardEvent, ctx: ToolContext) {
+    const key = e.key.toLowerCase();
+    // Axis keys take priority over numeric typing (checked first, and
+    // NumericBuffer never sees them) since 'x' would otherwise also read as
+    // a valid buffer character (a "WxH"-style separator, unused here but
+    // shared code with the draw tools). Unlike Move there's no "free" mode -
+    // rotation is always about some axis - so these set the axis rather than
+    // toggling a lock off.
+    if ((key === "x" || key === "y" || key === "z") && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      this.axis = key;
+      this.updateBasis();
+      if (this.dragging) {
+        // Re-anchor the drag on the new axis: recompute the start angle from
+        // the original grab point in the new plane, then re-derive the
+        // current angle from the last mouse position so the preview snaps to
+        // the new axis immediately without waiting for a mouse move.
+        this.startAngle = this.angleAt(this.startPoint);
+        this.currentAngle = this.startAngle;
+        if (this.lastMoveEvent) this.applyPointerAngle(this.lastMoveEvent, ctx);
+        this.updateGuideLine(ctx);
+        this.updatePreviewPositions();
+      }
+      return;
+    }
+
     if (this.dragging) {
       if (e.key === "Enter") {
         if (!this.numeric.isEmpty) void this.onPointerUp();
@@ -102,6 +165,7 @@ export class RotateTool implements Tool {
         return;
       }
     }
+
     if (e.key === "Escape" && this.dragging) {
       this.dragging = false;
       this.targetFaceIds = [];
@@ -112,11 +176,25 @@ export class RotateTool implements Tool {
   deactivate() {
     this.dragging = false;
     this.targetFaceIds = [];
+    this.axis = "z";
     this.clearPreview();
   }
 
+  /// Rebuilds the perpendicular basis and rotation plane for the current
+  /// spin axis and pivot. `ref` avoids being parallel to the axis; the
+  /// cross-product chain yields a right-handed (u, v, axis) frame, and for
+  /// the default Z axis reproduces exactly the old (u = X, v = Y) behavior.
+  private updateBasis() {
+    const n = AXIS_VECTORS[this.axis];
+    const ref = Math.abs(n.y) < 0.9 ? AXIS_VECTORS.y : AXIS_VECTORS.x;
+    this.basisU = new THREE.Vector3().crossVectors(ref, n).normalize();
+    this.basisV = new THREE.Vector3().crossVectors(n, this.basisU).normalize();
+    this.rotationPlane.setFromNormalAndCoplanarPoint(n, this.pivot);
+  }
+
   private angleAt(point: THREE.Vector3): number {
-    return Math.atan2(point.y - this.pivot.y, point.x - this.pivot.x);
+    const d = new THREE.Vector3().subVectors(point, this.pivot);
+    return Math.atan2(d.dot(this.basisV), d.dot(this.basisU));
   }
 
   /// The typed buffer holds degrees (more natural to type than radians);
@@ -191,16 +269,22 @@ export class RotateTool implements Tool {
   private updatePreviewPositions() {
     if (!this.previewMesh || !this.previewEdges || !this.basePositions) return;
     const angle = this.effectiveAngle();
-    const cos = Math.cos(angle);
-    const sin = Math.sin(angle);
+    // Rotate each vertex about the (pivot, axis) line - a quaternion handles
+    // any axis, where the old code's inline cos/sin only ever rotated in XY.
+    const quat = new THREE.Quaternion().setFromAxisAngle(AXIS_VECTORS[this.axis], angle);
     const n = this.basePositions.length;
     const out = new Float32Array(n);
+    const p = new THREE.Vector3();
     for (let i = 0; i < n; i += 3) {
-      const dx = this.basePositions[i] - this.pivot.x;
-      const dy = this.basePositions[i + 1] - this.pivot.y;
-      out[i] = this.pivot.x + dx * cos - dy * sin;
-      out[i + 1] = this.pivot.y + dx * sin + dy * cos;
-      out[i + 2] = this.basePositions[i + 2];
+      p.set(
+        this.basePositions[i] - this.pivot.x,
+        this.basePositions[i + 1] - this.pivot.y,
+        this.basePositions[i + 2] - this.pivot.z,
+      );
+      p.applyQuaternion(quat);
+      out[i] = p.x + this.pivot.x;
+      out[i + 1] = p.y + this.pivot.y;
+      out[i + 2] = p.z + this.pivot.z;
     }
     for (const geometry of [this.previewMesh.geometry, this.previewEdges.geometry]) {
       const attr = geometry.getAttribute("position") as THREE.BufferAttribute;
@@ -209,7 +293,38 @@ export class RotateTool implements Tool {
       geometry.computeBoundingSphere();
     }
     this.previewMesh.geometry.computeVertexNormals();
-    measurementHud.show("Rotate", `${THREE.MathUtils.radToDeg(angle).toFixed(1)}°`, this.numeric.isEmpty ? null : this.numeric.display);
+    measurementHud.show(
+      `Rotate (${this.axis.toUpperCase()})`,
+      `${THREE.MathUtils.radToDeg(angle).toFixed(1)}°`,
+      this.numeric.isEmpty ? null : this.numeric.display,
+    );
+  }
+
+  /// Draws an axis-colored line through the pivot along the spin axis while
+  /// dragging (or removes it when idle) so the active rotation axis is
+  /// always visible - the feedback the Z-only version never had.
+  private updateGuideLine(ctx: ToolContext) {
+    this.removeGuideLine();
+    if (!this.dragging) return;
+    const axis = AXIS_VECTORS[this.axis];
+    const a = this.pivot.clone().addScaledVector(axis, -GUIDE_LENGTH);
+    const b = this.pivot.clone().addScaledVector(axis, GUIDE_LENGTH);
+    const geometry = new THREE.BufferGeometry().setFromPoints([a, b]);
+    const material = new THREE.LineBasicMaterial({
+      color: AXIS_COLORS[this.axis],
+      transparent: true,
+      opacity: 0.6,
+    });
+    this.guideLine = new THREE.Line(geometry, material);
+    ctx.scene.add(this.guideLine);
+  }
+
+  private removeGuideLine() {
+    if (!this.guideLine) return;
+    this.guideLine.parent?.remove(this.guideLine);
+    this.guideLine.geometry.dispose();
+    (this.guideLine.material as THREE.Material).dispose();
+    this.guideLine = null;
   }
 
   private clearPreview() {
@@ -226,6 +341,7 @@ export class RotateTool implements Tool {
       this.previewEdges = null;
     }
     this.basePositions = null;
+    this.removeGuideLine();
     this.numeric.clear();
     measurementHud.hide();
   }
