@@ -61,8 +61,14 @@ Other controls:
   reactors, crew cabins, solar sails, …) with 3D-print tips. A part's dot turns **green** once
   it's modeled — i.e. once a group of that name exists. Click a green part's **Select** to
   reselect its geometry; with a selection active, click an unmodeled part's **Tag** to mark that
-  selection as the part. Click a part's name to expand its description and print tip. Edit
-  `src/ui/parts-catalog-data.ts` to grow or change the list.
+  selection as the part. Click a part's name to expand its description, print tip, and material.
+  Edit `src/ui/parts-catalog-data.ts` to grow or change the list.
+  - **Mass estimate**: each modeled part shows an estimated mass = enclosed solid volume ×
+    scale³ × material density. Pick a **material** in the part's expanded row, and set the global
+    **scale** ("1 unit = _ m", default `0.001`, i.e. model drawn true-size in mm) — the header
+    shows the running **total dry mass**. Volume is computed from the model geometry; hollow parts
+    (thin-walled hulls, tanks) are treated as solid and so read heavy. Material and scale choices
+    persist between sessions (stored locally, not in the project file).
 - **File menu**: save/open a project, and export STL (export is blocked if the model isn't a
   watertight, printable solid).
 

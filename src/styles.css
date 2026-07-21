@@ -217,7 +217,7 @@ body {
 .parts-catalog {
   position: fixed;
   top: 12px;
-  right: 224px;
+  right: 248px;
   width: 220px;
   display: flex;
   flex-direction: column;
@@ -264,14 +264,28 @@ body {
 
 .parts-catalog-title {
   flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 0.85em;
   font-weight: 600;
   color: inherit;
 }
 
 .parts-catalog-progress {
+  flex: 0 0 auto;
   font-size: 0.75em;
   color: #9aa0a8;
+}
+
+.parts-catalog-total {
+  flex: 0 0 auto;
+  font-size: 17px;
+  font-weight: 700;
+  color: #f0f0f0;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .parts-catalog-list {
@@ -359,11 +373,65 @@ body {
   background-color: #4a5058;
 }
 
+.parts-catalog-mass {
+  flex: 0 0 auto;
+  font-size: 13px;
+  color: #9aa0a8;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.parts-catalog-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 2px 6px;
+  border-bottom: 1px solid #3a3f47;
+}
+
+.parts-catalog-scale {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  color: #b3b8bf;
+}
+
+.parts-catalog-scale input {
+  width: 72px;
+  border: 1px solid #4a5058;
+  border-radius: 6px;
+  padding: 3px 6px;
+  font-size: 13px;
+  background-color: #23262b;
+  color: #f0f0f0;
+}
+
 .parts-catalog-detail {
   padding: 4px 6px 8px 22px;
   font-size: 14px;
   color: #b3b8bf;
   line-height: 1.4;
+}
+
+.parts-catalog-material {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+  color: #cdd2d8;
+}
+
+.parts-catalog-material select {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid #4a5058;
+  border-radius: 6px;
+  padding: 3px 24px 3px 6px;
+  font-size: 13px;
+  background-color: #23262b;
+  color: #f0f0f0;
+  text-overflow: ellipsis;
 }
 
 .parts-catalog-tip {
