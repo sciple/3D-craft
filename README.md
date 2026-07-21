@@ -51,6 +51,7 @@ to set an exact value (mm, or degrees for Rotate) and press **Enter** to commit;
 | Scale | `G` | Scale the selection about its center. |
 | Move | `M` | Drag to reposition. Hold `Shift` for vertical; press `X`/`Y`/`Z` to lock to an axis. |
 | Rotate | `T` | Drag to rotate. Press `X`/`Y`/`Z` to choose the spin axis (defaults to Z). |
+| Measure | `E` | Click two points to read the straight-line distance plus X/Y/Z deltas. Snaps to corners/midpoints/edges, or free points on faces/ground; `Esc` cancels. Creates no geometry. |
 
 Other controls:
 

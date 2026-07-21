@@ -11,6 +11,7 @@ import { InsetTool } from "./tools/inset-tool";
 import { ScaleTool } from "./tools/scale-tool";
 import { MoveTool } from "./tools/move-tool";
 import { RotateTool } from "./tools/rotate-tool";
+import { MeasureTool } from "./tools/measure-tool";
 import { createToolbar } from "./ui/toolbar";
 import { createOutliner } from "./ui/outliner";
 import { createPartsCatalog } from "./ui/parts-catalog";
@@ -44,6 +45,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   const scaleTool = new ScaleTool();
   const moveTool = new MoveTool();
   const rotateTool = new RotateTool();
+  const measureTool = new MeasureTool();
 
   createToolbar(uiRootEl, toolManager, [
     { tool: selectTool, label: "Select", shortcut: "s", icon: icons.select },
@@ -55,6 +57,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     { tool: scaleTool, label: "Scale", shortcut: "g", icon: icons.scale },
     { tool: moveTool, label: "Move", shortcut: "m", icon: icons.move },
     { tool: rotateTool, label: "Rotate", shortcut: "t", icon: icons.rotate },
+    { tool: measureTool, label: "Measure", shortcut: "e", icon: icons.measure },
   ]);
   toolManager.setTool(selectTool);
   createOutliner(uiRootEl);
