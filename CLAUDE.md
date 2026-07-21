@@ -33,7 +33,7 @@ Because `cargo test`/`cargo build`/`cargo add` share the same `target/` director
 
 **Z-up world convention** throughout (matches SketchUp and STL/3D-printing slicer conventions), not the Y-up convention common in other three.js apps.
 
-**1 world unit = 1 mm** throughout (STL itself is unitless, but every slicer assumes mm on import, so this keeps export conversion-free). Purely a modeling/UI convention — geometry code has no notion of units — but it's why the ground grid is sized 100×100 in 5-unit cells and the measurement HUD labels values "mm".
+**1 world unit = 1 mm** throughout (STL itself is unitless, but every slicer assumes mm on import, so this keeps export conversion-free). Purely a modeling/UI convention — geometry code has no notion of units — but it's why the ground grid is sized 100×100 in 10-unit cells and the measurement HUD labels values "mm".
 
 ### Rust backend (`src-tauri/src/`)
 
