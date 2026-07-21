@@ -212,6 +212,23 @@ body {
   cursor: default;
 }
 
+/* Axis letters colored to match the viewport axes (red=X, green=Y, blue=Z). */
+.axis-label {
+  font-weight: 700;
+}
+
+.axis-x {
+  color: #ff6b6b;
+}
+
+.axis-y {
+  color: #51cf66;
+}
+
+.axis-z {
+  color: #4dabf7;
+}
+
 /* The Parts Catalog is a dropdown pinned below the outliner: collapsed to
    just its header bar so it never covers the 3D scene, expanded on click. */
 .parts-catalog {

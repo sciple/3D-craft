@@ -35,7 +35,13 @@ export function createOutliner(container: HTMLElement) {
   actionsRow.className = "outliner-actions-row";
   const mirrorButtons = (["x", "y", "z"] as const).map((axis) => {
     const button = document.createElement("button");
-    button.textContent = `Mirror ${axis.toUpperCase()}`;
+    // Color just the axis letter to match the viewport axes (red=X, green=Y,
+    // blue=Z, same as the scene's AxesHelper) for quick visual matching.
+    button.append("Mirror ");
+    const letter = document.createElement("span");
+    letter.className = `axis-label axis-${axis}`;
+    letter.textContent = axis.toUpperCase();
+    button.appendChild(letter);
     button.title = `Mirror selection across ${axis.toUpperCase()} = 0`;
     button.addEventListener("click", () => {
       const selected = documentStore.getSnapshot().selected_face_ids;
