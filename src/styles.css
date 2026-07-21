@@ -212,6 +212,165 @@ body {
   cursor: default;
 }
 
+/* The Parts Catalog is a dropdown pinned below the outliner: collapsed to
+   just its header bar so it never covers the 3D scene, expanded on click. */
+.parts-catalog {
+  position: fixed;
+  top: 12px;
+  right: 224px;
+  width: 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  pointer-events: auto;
+}
+
+.parts-catalog.is-open {
+  background: rgba(20, 22, 26, 0.75);
+  padding: 8px;
+  border-radius: 8px;
+  backdrop-filter: blur(4px);
+}
+
+.parts-catalog-header {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  text-align: left;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 8px;
+  color: #f0f0f0;
+  background: rgba(20, 22, 26, 0.75);
+  backdrop-filter: blur(4px);
+  cursor: pointer;
+}
+
+.parts-catalog.is-open .parts-catalog-header {
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  backdrop-filter: none;
+}
+
+.parts-catalog-header:hover {
+  color: #ffffff;
+}
+
+.parts-catalog-caret {
+  font-size: 0.8em;
+  color: #9aa0a8;
+}
+
+.parts-catalog-title {
+  flex: 1;
+  font-size: 0.85em;
+  font-weight: 600;
+  color: inherit;
+}
+
+.parts-catalog-progress {
+  font-size: 0.75em;
+  color: #9aa0a8;
+}
+
+.parts-catalog-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.parts-catalog-cat {
+  text-align: left;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin-top: 4px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #cdd2d8;
+  background-color: #2b2f36;
+  cursor: pointer;
+}
+
+.parts-catalog-cat:hover {
+  background-color: #343943;
+}
+
+.parts-catalog-part {
+  display: flex;
+  flex-direction: column;
+}
+
+.parts-catalog-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 4px;
+}
+
+.parts-catalog-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: #565c65;
+}
+
+.parts-catalog-dot.is-modeled {
+  background-color: #4caf50;
+  box-shadow: 0 0 4px rgba(76, 175, 80, 0.7);
+}
+
+.parts-catalog-name {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: none;
+  background: transparent;
+  color: #e8e8e8;
+  font-size: 15px;
+  padding: 4px 2px;
+  cursor: pointer;
+}
+
+.parts-catalog-name:hover {
+  color: #ffffff;
+}
+
+.parts-catalog-action {
+  flex: 0 0 auto;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 14px;
+  font-weight: 500;
+  color: #f0f0f0;
+  background-color: #3a3f47;
+  cursor: pointer;
+}
+
+.parts-catalog-action:hover {
+  background-color: #4a5058;
+}
+
+.parts-catalog-detail {
+  padding: 4px 6px 8px 22px;
+  font-size: 14px;
+  color: #b3b8bf;
+  line-height: 1.4;
+}
+
+.parts-catalog-tip {
+  margin-top: 3px;
+  color: #8fb98f;
+}
+
 .measurement-hud {
   position: fixed;
   left: 50%;

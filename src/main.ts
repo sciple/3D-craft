@@ -13,6 +13,7 @@ import { MoveTool } from "./tools/move-tool";
 import { RotateTool } from "./tools/rotate-tool";
 import { createToolbar } from "./ui/toolbar";
 import { createOutliner } from "./ui/outliner";
+import { createPartsCatalog } from "./ui/parts-catalog";
 import { createFileMenu } from "./ui/file-menu";
 import { icons } from "./ui/icons";
 
@@ -57,6 +58,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   ]);
   toolManager.setTool(selectTool);
   createOutliner(uiRootEl);
+  createPartsCatalog(uiRootEl);
   createFileMenu(uiRootEl);
 
   documentStore.subscribe((snapshot) => meshRenderer.update(snapshot));

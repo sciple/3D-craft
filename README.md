@@ -57,6 +57,12 @@ Other controls:
 - **Camera**: orbit, pan, and zoom with the mouse (SketchUp-style), Z-up.
 - **Undo / Redo**: `Ctrl+Z` / `Ctrl+Y` (or `Ctrl+Shift+Z`).
 - **Outliner** (right panel): manage groups and mirror a copy of the selection across X/Y/Z.
+- **Parts Catalog** (collapsible dropdown, top right): a guided build manifest of spacecraft subsystems (propulsion,
+  reactors, crew cabins, solar sails, …) with 3D-print tips. A part's dot turns **green** once
+  it's modeled — i.e. once a group of that name exists. Click a green part's **Select** to
+  reselect its geometry; with a selection active, click an unmodeled part's **Tag** to mark that
+  selection as the part. Click a part's name to expand its description and print tip. Edit
+  `src/ui/parts-catalog-data.ts` to grow or change the list.
 - **File menu**: save/open a project, and export STL (export is blocked if the model isn't a
   watertight, printable solid).
 
