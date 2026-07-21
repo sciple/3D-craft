@@ -1,7 +1,69 @@
-# Tauri + Vanilla TS
+# 3D-craft
 
-This template should help get you started developing with Tauri in vanilla HTML, CSS and Typescript.
+A lightweight native Windows CAD tool for modeling small parts to 3D print, inspired by
+SketchUp's workflow. Built with Rust + Tauri v2 + three.js. Sketch a face, push/pull it into a
+solid, refine, and export a print-ready STL (millimeters, Z-up).
 
-## Recommended IDE Setup
+## Install
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+Prerequisites:
+
+- [Rust](https://www.rust-lang.org/tools/install) (stable) with the MSVC toolchain
+- [Node.js](https://nodejs.org/) 18+
+- Windows with the [Tauri v2 prerequisites](https://v2.tauri.app/start/prerequisites/) (WebView2 +
+  the "Desktop development with C++" build tools)
+
+Then, from the repo root:
+
+```sh
+npm install
+```
+
+## Run
+
+```sh
+npm run tauri dev
+```
+
+This launches the full app in a native window (Vite dev server + Rust backend), with hot-reload on
+frontend changes and automatic backend recompiles.
+
+To produce a distributable build:
+
+```sh
+npm run tauri build
+```
+
+## Operation
+
+Pick a tool from the left toolbar (or press its shortcut). Most tools work on the clicked face, or
+on the whole selection if the clicked face is already selected. While dragging, **type a number**
+to set an exact value (mm, or degrees for Rotate) and press **Enter** to commit; **Esc** cancels.
+
+| Tool | Key | What it does |
+| --- | --- | --- |
+| Select | `S` | Click a face to select. `Ctrl+D` duplicates the selection. |
+| Rectangle | `R` | Draw a rectangle on the ground or on an existing face. |
+| Circle | `C` | Draw a circle. |
+| Polygon | `L` | Click points to draw a closed polygon. |
+| Push/Pull | `P` | Drag a face along its normal to extrude a solid (or carve inward). |
+| Inset | `I` | Offset a face's border inward. |
+| Scale | `G` | Scale the selection about its center. |
+| Move | `M` | Drag to reposition. Hold `Shift` for vertical; press `X`/`Y`/`Z` to lock to an axis. |
+| Rotate | `T` | Drag to rotate. Press `X`/`Y`/`Z` to choose the spin axis (defaults to Z). |
+
+Other controls:
+
+- **Camera**: orbit, pan, and zoom with the mouse (SketchUp-style), Z-up.
+- **Undo / Redo**: `Ctrl+Z` / `Ctrl+Y` (or `Ctrl+Shift+Z`).
+- **Outliner** (right panel): manage groups and mirror a copy of the selection across X/Y/Z.
+- **File menu**: save/open a project, and export STL (export is blocked if the model isn't a
+  watertight, printable solid).
+
+## Development
+
+- `npm run tauri dev` — run the app (primary dev loop)
+- `npx tsc --noEmit` — type-check the frontend
+- `cd src-tauri && cargo test` — run the Rust test suite
+
+See [CLAUDE.md](CLAUDE.md) for architecture and contributor notes.

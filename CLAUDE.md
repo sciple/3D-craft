@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A lightweight native Windows desktop CAD tool (Rust + Tauri v2 + three.js), inspired by SketchUp's modeling workflow, for one specific use case: modeling small parts to 3D print. It is deliberately not a general CAD replacement — favor the simplest correct implementation over generality or completeness when extending it.
 
+**Keep `README.md` up to date**: it holds the user-facing install/run/operation guide (the tool list, shortcuts, and controls). Whenever a change adds, removes, or meaningfully alters user-facing functionality — a new tool, a changed shortcut/keybinding, a new file-menu action, or a workflow change — update `README.md` in the same change so it stays accurate. Internal refactors with no user-visible effect don't need a README edit.
+
 ## Commands
 
 Run all commands from the repo root unless noted.
