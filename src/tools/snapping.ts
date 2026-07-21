@@ -107,33 +107,28 @@ export function raycastPlaneSnapped(
   return { point: snap ? snap.point : raw, snap };
 }
 
-/// Screen-space snap for tools that pick anywhere in the scene (e.g. the tape
-/// measure), rather than being constrained to a single sketch plane like
-/// `findPlanarSnap`. Every candidate vertex/midpoint/edge point is projected
-/// to the viewport and compared to the cursor in pixels, so the ~12px
-/// tolerance reads the same at any zoom. Priority matches the planar snap:
-/// endpoint beats midpoint beats along-edge. Returns null when nothing is
-/// within tolerance.
+/// Snap for tools that pick anywhere in the scene (e.g. the tape measure),
+/// rather than being constrained to a single sketch plane like
+/// `findPlanarSnap`. Anchored at the 3D point actually under the cursor
+/// (`anchor` - the raycast hit on the hovered surface, or the ground point),
+/// with a world-space `tolerance`, so it only considers geometry genuinely
+/// near that point. This is deliberately NOT a pure screen-space test: a
+/// distant vertex that merely projects near the cursor (e.g. a back corner of
+/// a box lining up behind the front corner you're hovering) is far from the
+/// anchor in 3D and so is correctly ignored - the earlier screen-space version
+/// grabbed it, which collapsed a face diagonal to a side length. Priority
+/// endpoint > midpoint > edge, matching `findPlanarSnap`.
 export function findSnap3d(
   snapshot: DocumentSnapshot,
-  cursorPx: THREE.Vector2,
-  camera: THREE.PerspectiveCamera,
-  domElement: HTMLElement,
-  ray: THREE.Ray,
+  anchor: THREE.Vector3,
+  tolerance: number,
 ): SnapResult | null {
-  const rect = domElement.getBoundingClientRect();
-  const toPixels = (p: THREE.Vector3): THREE.Vector2 | null => {
-    const n = p.clone().project(camera);
-    if (n.z <= -1 || n.z >= 1) return null; // behind the camera / outside the depth range
-    return new THREE.Vector2((n.x * 0.5 + 0.5) * rect.width, (-n.y * 0.5 + 0.5) * rect.height);
-  };
+  const positionOf = (i: number) => new THREE.Vector3(...snapshot.vertices[i]);
   const nearestWithin = (points: THREE.Vector3[], kind: SnapKind): SnapResult | null => {
     let best: SnapResult | null = null;
-    let bestDist = SNAP_PIXELS;
+    let bestDist = tolerance;
     for (const p of points) {
-      const px = toPixels(p);
-      if (!px) continue;
-      const d = px.distanceTo(cursorPx);
+      const d = p.distanceTo(anchor);
       if (d < bestDist) {
         bestDist = d;
         best = { point: p.clone(), kind };
@@ -141,8 +136,6 @@ export function findSnap3d(
     }
     return best;
   };
-
-  const positionOf = (i: number) => new THREE.Vector3(...snapshot.vertices[i]);
 
   const endpoints = snapshot.vertices.map((_, i) => positionOf(i));
   const endpointHit = nearestWithin(endpoints, "endpoint");
@@ -156,7 +149,7 @@ export function findSnap3d(
         const pa = positionOf(loop[i]);
         const pb = positionOf(loop[(i + 1) % loop.length]);
         midpoints.push(pa.clone().add(pb).multiplyScalar(0.5));
-        edgePoints.push(closestPointOnSegmentToRay(pa, pb, ray));
+        edgePoints.push(closestPointOnSegment(anchor, pa, pb));
       }
     }
   }
@@ -166,43 +159,34 @@ export function findSnap3d(
   return nearestWithin(edgePoints, "edge");
 }
 
-/// Closest point on segment [a,b] to the (infinite) pointer ray - the 3D
-/// analogue of `closestPointOnSegment`, used for "along an edge" snapping when
-/// there's no sketch plane to project onto.
-function closestPointOnSegmentToRay(a: THREE.Vector3, b: THREE.Vector3, ray: THREE.Ray): THREE.Vector3 {
-  const u = new THREE.Vector3().subVectors(b, a);
-  const w0 = new THREE.Vector3().subVectors(a, ray.origin);
-  const A = u.dot(u);
-  const B = u.dot(ray.direction);
-  const C = ray.direction.dot(ray.direction); // 1 for a normalized ray, kept general
-  const D = u.dot(w0);
-  const E = ray.direction.dot(w0);
-  const denom = A * C - B * B;
-  const s = THREE.MathUtils.clamp(denom < 1e-9 ? 0 : (B * E - C * D) / denom, 0, 1);
-  return a.clone().addScaledVector(u, s);
-}
-
-/// Full pick for a 3D measuring tool: snap to nearby geometry if within
-/// tolerance, otherwise a free point on the hovered surface, otherwise the
-/// ground plane. Returns null only when the ray hits nothing at all.
+/// Full pick for a 3D measuring tool: the raycast hit on the hovered surface
+/// (or the ground point) becomes the anchor and free-point fallback, then
+/// `findSnap3d` refines it to nearby geometry within ~12px (sized in world
+/// units at the anchor's depth). Returns null only when the ray hits nothing.
 export function raycastSnapped3d(
   e: PointerEvent,
   ctx: ToolContext,
   raycaster: THREE.Raycaster,
 ): { point: THREE.Vector3; snap: SnapResult | null } | null {
-  const rect = ctx.domElement.getBoundingClientRect();
-  const cursorPx = new THREE.Vector2(e.clientX - rect.left, e.clientY - rect.top);
   raycaster.setFromCamera(pointerToNdc(e, ctx.domElement), ctx.camera);
 
-  const snap = findSnap3d(documentStore.getSnapshot(), cursorPx, ctx.camera, ctx.domElement, raycaster.ray);
-  if (snap) return { point: snap.point, snap };
-
   const surfaceHit = raycaster.intersectObject(ctx.meshRenderer.mesh)[0];
-  if (surfaceHit) return { point: surfaceHit.point.clone(), snap: null };
+  let anchor: THREE.Vector3 | null = surfaceHit ? surfaceHit.point.clone() : null;
+  if (!anchor) {
+    const ground = new THREE.Vector3();
+    anchor = raycaster.ray.intersectPlane(GROUND_PLANE, ground) ? ground : null;
+  }
+  if (!anchor) return null;
 
-  const ground = new THREE.Vector3();
-  if (raycaster.ray.intersectPlane(GROUND_PLANE, ground)) return { point: ground, snap: null };
-  return null;
+  // World tolerance sized to read as a constant ~12px at the anchor's depth,
+  // matching findPlanarSnap's zoom-independent feel.
+  const rect = ctx.domElement.getBoundingClientRect();
+  const distance = Math.max(0.001, ctx.camera.position.distanceTo(anchor));
+  const worldPerPixel = (2 * distance * Math.tan((ctx.camera.fov * Math.PI) / 360)) / rect.height;
+  const tolerance = SNAP_PIXELS * worldPerPixel;
+
+  const snap = findSnap3d(documentStore.getSnapshot(), anchor, tolerance);
+  return { point: snap ? snap.point : anchor, snap };
 }
 
 const SNAP_COLORS: Record<SnapKind, number> = {
