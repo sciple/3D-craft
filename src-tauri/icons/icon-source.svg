@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F5F9FD"/>
+      <stop offset="1" stop-color="#DCE7F2"/>
+    </linearGradient>
+  </defs>
+
+  <!-- rounded app tile -->
+  <rect x="0" y="0" width="1024" height="1024" rx="224" ry="224" fill="url(#bg)"/>
+
+  <!-- contact shadow under the cube -->
+  <ellipse cx="512" cy="852" rx="280" ry="52" fill="#1C3B5E" opacity="0.13"/>
+
+  <!-- isometric cube: top light, left mid, right dark -->
+  <!-- right face (darkest) -->
+  <polygon points="512,512 812,362 812,662 512,812" fill="#275E9E"/>
+  <!-- left face (mid) -->
+  <polygon points="212,362 512,512 512,812 212,662" fill="#3D86D2"/>
+  <!-- top face (lightest) -->
+  <polygon points="512,212 812,362 512,512 212,362" fill="#83C6F5"/>
+
+  <!-- crisp edges between faces -->
+  <g fill="none" stroke="#1C4C80" stroke-width="5" stroke-linejoin="round" opacity="0.28">
+    <polygon points="512,212 812,362 812,662 512,812 212,662 212,362"/>
+    <polyline points="212,362 512,512 812,362"/>
+    <polyline points="512,512 512,812"/>
+  </g>
+
+  <!-- push/pull cue: an inset face highlight on the top -->
+  <polygon points="512,287 662,362 512,437 362,362" fill="none" stroke="#CDE8FB" stroke-width="6" stroke-linejoin="round" opacity="0.85"/>
+</svg>
