@@ -32,6 +32,29 @@ pub fn add_circle(mesh: &mut Mesh, plane: &Plane, center: DVec2, radius: f64, se
     mesh.add_face(loop_ids, vec![])
 }
 
+/// Builds a chord-closed circular segment (an arc, closed by a straight line
+/// between its two endpoints rather than through a center point), wound
+/// counter-clockwise as seen from `plane.normal` for a positive sweep, and
+/// adds it as a face. At a 180 degree sweep this is an exact semicircle
+/// ("D" shape) - a half-pipe cross-section once pushed/pulled or inset.
+/// Point order doesn't need to be CCW-correct on its own: like
+/// `add_polyline_loop`, callers route this through `Document::resplit`,
+/// which re-derives winding from the undirected edge graph regardless of
+/// input order.
+pub fn add_arc(mesh: &mut Mesh, plane: &Plane, center: DVec2, radius: f64, start_angle_deg: f64, sweep_deg: f64, segments: usize) -> FaceId {
+    let segments = segments.max(2); // segments+1 points, at least 3 for a valid face
+    let start = start_angle_deg.to_radians();
+    let sweep = sweep_deg.to_radians();
+    let loop_ids: Vec<VertexId> = (0..=segments)
+        .map(|i| {
+            let angle = start + sweep * (i as f64 / segments as f64);
+            let p = center + DVec2::new(angle.cos(), angle.sin()) * radius;
+            mesh.add_vertex(plane.to_3d(p))
+        })
+        .collect();
+    mesh.add_face(loop_ids, vec![])
+}
+
 /// Builds a face from an explicit closed loop of plane-local points, e.g.
 /// once the line/polyline draw tool closes back on its start point.
 pub fn add_polyline_loop(mesh: &mut Mesh, plane: &Plane, points_2d: &[DVec2]) -> Option<FaceId> {
@@ -55,6 +78,25 @@ mod tests {
         let face = &mesh.faces[face_id];
         assert_eq!(face.outer.len(), 4);
         assert!((face.normal - DVec3::Z).length() < 1e-9);
+    }
+
+    #[test]
+    fn arc_has_requested_point_count_and_correct_endpoints() {
+        let mut mesh = Mesh::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let face_id = add_arc(&mut mesh, &plane, DVec2::ZERO, 5.0, 0.0, 180.0, 16);
+        let face = &mesh.faces[face_id];
+        assert_eq!(face.outer.len(), 17); // segments + 1
+
+        for &v in &face.outer {
+            let p = mesh.position(v);
+            assert!((p.length() - 5.0).abs() < 1e-9);
+        }
+
+        let start = mesh.position(face.outer[0]);
+        assert!((start - DVec3::new(5.0, 0.0, 0.0)).length() < 1e-9);
+        let end = mesh.position(*face.outer.last().unwrap());
+        assert!((end - DVec3::new(-5.0, 0.0, 0.0)).length() < 1e-6);
     }
 
     #[test]

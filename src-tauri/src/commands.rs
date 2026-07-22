@@ -114,6 +114,25 @@ pub fn draw_circle(
 }
 
 #[tauri::command]
+pub fn draw_arc(
+    state: State<AppState>,
+    plane_origin: DVec3,
+    plane_normal: DVec3,
+    center: DVec2,
+    radius: f64,
+    start_angle_deg: f64,
+    sweep_deg: f64,
+    segments: u32,
+    target_face_id: Option<FaceId>,
+) -> DocumentSnapshot {
+    let mut history = state.0.lock().unwrap();
+    history.record();
+    let plane = Plane::from_normal(plane_origin, plane_normal);
+    history.document.draw_arc(&plane, center, radius, start_angle_deg, sweep_deg, segments as usize, target_face_id);
+    history.document.snapshot()
+}
+
+#[tauri::command]
 pub fn draw_polygon(
     state: State<AppState>,
     plane_origin: DVec3,

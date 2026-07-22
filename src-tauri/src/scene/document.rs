@@ -89,6 +89,25 @@ impl Document {
         self.resplit(plane, new_loop, target_face_id)
     }
 
+    /// Draws a chord-closed circular segment (the Arc tool) - see
+    /// `primitives::add_arc` for the shape this produces and why it's
+    /// chord-closed rather than routed through a center vertex.
+    pub fn draw_arc(
+        &mut self,
+        plane: &Plane,
+        center: DVec2,
+        radius: f64,
+        start_angle_deg: f64,
+        sweep_deg: f64,
+        segments: usize,
+        target_face_id: Option<FaceId>,
+    ) -> Vec<FaceId> {
+        let temp_face_id = primitives::add_arc(&mut self.mesh, plane, center, radius, start_angle_deg, sweep_deg, segments);
+        let new_loop = self.mesh.faces[temp_face_id].outer.clone();
+        self.mesh.remove_face(temp_face_id);
+        self.resplit(plane, new_loop, target_face_id)
+    }
+
     /// Draws a closed polygon from explicit click points (the Polygon/Line
     /// tool). Point winding doesn't matter: resplit_plane's face_detect pass
     /// re-derives correct orientation from the undirected edge graph either
@@ -742,6 +761,39 @@ mod tests {
         assert_eq!(new_faces.len(), 12);
         assert!(pushpull::is_manifold(&doc.mesh, &new_faces));
         assert_eq!(doc.mesh.faces.len(), 12);
+    }
+
+    #[test]
+    fn draw_arc_at_180_degrees_is_a_pushable_manifold_semicircle() {
+        // The exact sweep a half-pipe cross-section needs, and the one angle
+        // where a center-vertex ("pie") closure would have been numerically
+        // fragile - the chord closure this tool uses has no center vertex,
+        // so this must stay manifold with no special-casing.
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let face_ids = doc.draw_arc(&plane, DVec2::ZERO, 5.0, 0.0, 180.0, 16, None);
+        assert_eq!(face_ids.len(), 1);
+
+        let new_faces = doc.push_pull(face_ids[0], 3.0);
+        assert!(pushpull::is_manifold(&doc.mesh, &new_faces), "extruded semicircle should be a watertight solid");
+    }
+
+    #[test]
+    fn arc_inset_then_pushpull_makes_a_hollow_manifold_half_pipe() {
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let face_id = doc.draw_arc(&plane, DVec2::ZERO, 10.0, 0.0, 180.0, 16, None)[0];
+
+        let inset_faces = doc.inset_face(face_id, 1.0);
+        assert_eq!(inset_faces.len(), 2);
+        let frame_id = inset_faces
+            .iter()
+            .copied()
+            .find(|&id| !doc.mesh.faces[id].holes.is_empty())
+            .expect("inset should produce an outer frame face with a hole");
+
+        let new_faces = doc.push_pull(frame_id, 4.0);
+        assert!(pushpull::is_manifold(&doc.mesh, &new_faces), "extruded ring-shaped arc frame should be a hollow, watertight half-pipe");
     }
 
     #[test]

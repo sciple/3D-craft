@@ -130,6 +130,36 @@ class DocumentStore {
     });
   }
 
+  /// `startAngleDeg`/`sweepDeg`: the arc runs from `startAngleDeg` through
+  /// `startAngleDeg + sweepDeg` and is closed with a straight chord between
+  /// its two endpoints (no center vertex) - see `add_arc` on the Rust side
+  /// for why the chord closure was chosen over a center-connected pie/wedge.
+  drawArc(
+    planeOrigin: Vec3,
+    planeNormal: Vec3,
+    center: Vec2,
+    radius: number,
+    startAngleDeg: number,
+    sweepDeg: number,
+    segments: number,
+    targetFaceId?: FaceId,
+  ) {
+    return this.enqueue(async () => {
+      this.apply(
+        await invoke<DocumentSnapshot>("draw_arc", {
+          planeOrigin,
+          planeNormal,
+          center,
+          radius,
+          startAngleDeg,
+          sweepDeg,
+          segments,
+          targetFaceId: targetFaceId ?? null,
+        }),
+      );
+    });
+  }
+
   drawPolygon(planeOrigin: Vec3, planeNormal: Vec3, points: Vec2[], targetFaceId?: FaceId) {
     return this.enqueue(async () => {
       this.apply(

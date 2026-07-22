@@ -280,6 +280,220 @@ export class DrawCircleTool implements Tool {
   }
 }
 
+/// Click-click-click arc tool: first click resolves the sketch plane and
+/// sets the center (like Circle); second click sets the radius and start
+/// angle (a typed number overrides the radius, mirroring
+/// `DrawCircleTool.effectiveRadius`); third click (or a typed degree value +
+/// Enter) sweeps the arc from the start angle and commits. The arc is closed
+/// with a straight chord between its two endpoints rather than through a
+/// center vertex - see `add_arc` on the Rust side for why (a center-vertex
+/// "pie" closure has a numerically fragile case at exactly 180 degrees, the
+/// sweep a half-pipe cross-section needs most).
+export class DrawArcTool implements Tool {
+  readonly name = "arc";
+  private static readonly FULL_CIRCLE_SEGMENTS = 32;
+
+  private raycaster = new THREE.Raycaster();
+  private activePlane: SketchPlane | null = null;
+  private center: THREE.Vector2 | null = null;
+  private currentUv: THREE.Vector2 | null = null;
+  private radius: number | null = null;
+  private startAngleRad: number | null = null;
+  private numeric = new NumericBuffer();
+  private preview = new PreviewLine();
+  private snapIndicator = new SnapIndicator();
+
+  constructor(private onCommitted?: () => void) {}
+
+  activate() {
+    this.activePlane = null;
+    this.center = null;
+    this.currentUv = null;
+    this.radius = null;
+    this.startAngleRad = null;
+    this.numeric.clear();
+  }
+
+  deactivate(ctx: ToolContext) {
+    this.reset(ctx);
+  }
+
+  onPointerDown(e: PointerEvent, ctx: ToolContext) {
+    if (e.button !== 0) return;
+
+    if (!this.activePlane) {
+      const target = resolveSketchTarget(e, ctx, this.raycaster);
+      if (!target) return;
+      const snap = findPlanarSnap(documentStore.getSnapshot(), target.point, target.plane, ctx.camera, ctx.domElement);
+      const point = snap ? snap.point : target.point;
+      this.activePlane = target.plane;
+      this.center = to2d(target.plane, point);
+      this.currentUv = this.center.clone();
+      return;
+    }
+
+    if (this.radius === null) {
+      this.commitRadiusStage(ctx);
+      return;
+    }
+
+    this.commit(ctx);
+  }
+
+  onPointerMove(e: PointerEvent, ctx: ToolContext) {
+    if (!this.activePlane) {
+      const target = resolveSketchTarget(e, ctx, this.raycaster);
+      if (!target) return;
+      const snap = findPlanarSnap(documentStore.getSnapshot(), target.point, target.plane, ctx.camera, ctx.domElement);
+      this.snapIndicator.update(ctx.scene, ctx.camera, snap);
+      return;
+    }
+
+    const hit = raycastPlaneSnapped(e, ctx, this.raycaster, this.activePlane);
+    if (!hit) return;
+    if (this.radius === null) {
+      this.snapIndicator.update(ctx.scene, ctx.camera, hit.snap);
+    } else {
+      this.snapIndicator.hide();
+    }
+    this.currentUv = to2d(this.activePlane, hit.point);
+    this.updatePreview(ctx);
+  }
+
+  onKeyDown(e: KeyboardEvent, ctx: ToolContext) {
+    if (this.activePlane && this.center) {
+      if (e.key === "Enter") {
+        if (!this.numeric.isEmpty) {
+          if (this.radius === null) this.commitRadiusStage(ctx);
+          else this.commit(ctx);
+        }
+        return;
+      }
+      if (e.key === "Escape" && !this.numeric.isEmpty) {
+        this.numeric.clear();
+        this.updatePreview(ctx);
+        return;
+      }
+      if (this.numeric.type(e)) {
+        this.updatePreview(ctx);
+        return;
+      }
+    }
+    if (e.key === "Escape") {
+      this.reset(ctx);
+    }
+  }
+
+  private effectiveRadius(): number | null {
+    if (!this.center || !this.currentUv) return null;
+    if (this.numeric.isEmpty) return this.center.distanceTo(this.currentUv);
+    const r = this.numeric.values()[0];
+    return r === undefined ? this.center.distanceTo(this.currentUv) : r;
+  }
+
+  private currentAngleRad(): number {
+    if (!this.center || !this.currentUv) return 0;
+    return Math.atan2(this.currentUv.y - this.center.y, this.currentUv.x - this.center.x);
+  }
+
+  /// Mirrors `RotateTool.effectiveAngle`'s convention exactly (a plain typed
+  /// number follows the current drag's sign, an explicit '-' overrides it),
+  /// just staying in degrees since that's what the backend expects.
+  private effectiveSweepDeg(): number {
+    if (this.startAngleRad === null) return 0;
+    const dragSweepDeg = THREE.MathUtils.radToDeg(this.currentAngleRad() - this.startAngleRad);
+    if (this.numeric.isEmpty) return dragSweepDeg;
+    const v = this.numeric.values()[0];
+    if (v === undefined) return dragSweepDeg;
+    if (this.numeric.display.includes("-")) return -Math.abs(v);
+    return dragSweepDeg < 0 ? -Math.abs(v) : Math.abs(v);
+  }
+
+  private static segmentsForSweep(sweepDeg: number): number {
+    return Math.max(2, Math.round((Math.abs(sweepDeg) / 360) * DrawArcTool.FULL_CIRCLE_SEGMENTS));
+  }
+
+  /// Locks in the radius (typed override or mouse distance) and the start
+  /// angle (always mouse-derived), then moves on to the sweep stage.
+  private commitRadiusStage(ctx: ToolContext) {
+    const radius = this.effectiveRadius();
+    if (!this.center || !this.currentUv || radius === null || radius < 1e-6) return;
+    this.radius = radius;
+    this.startAngleRad = this.currentAngleRad();
+    this.numeric.clear();
+    this.updatePreview(ctx);
+  }
+
+  private updatePreview(ctx: ToolContext) {
+    const plane = this.activePlane;
+    const center = this.center;
+    if (!plane || !center) return;
+
+    if (this.radius === null) {
+      const radius = this.effectiveRadius();
+      if (radius === null || !this.currentUv) return;
+      const dir = this.currentUv.clone().sub(center);
+      if (dir.lengthSq() < 1e-12) dir.set(1, 0);
+      else dir.normalize();
+      const endUv = center.clone().addScaledVector(dir, radius);
+      this.preview.update(ctx.scene, [to3d(plane, center), to3d(plane, endUv)]);
+      measurementHud.show("Arc radius", `${radius.toFixed(1)} mm`, this.numeric.isEmpty ? null : this.numeric.display);
+      return;
+    }
+
+    if (this.startAngleRad === null) return;
+    const sweepDeg = this.effectiveSweepDeg();
+    const segments = DrawArcTool.segmentsForSweep(sweepDeg);
+    const sweepRad = THREE.MathUtils.degToRad(sweepDeg);
+    const radius = this.radius;
+    const startAngleRad = this.startAngleRad;
+    const points: THREE.Vector3[] = [];
+    for (let i = 0; i <= segments; i++) {
+      const angle = startAngleRad + sweepRad * (i / segments);
+      points.push(to3d(plane, new THREE.Vector2(center.x + Math.cos(angle) * radius, center.y + Math.sin(angle) * radius)));
+    }
+    points.push(points[0].clone()); // close back to the arc's start via the chord
+    this.preview.update(ctx.scene, points);
+    measurementHud.show("Arc sweep", `${sweepDeg.toFixed(1)}°`, this.numeric.isEmpty ? null : this.numeric.display);
+  }
+
+  private commit(ctx: ToolContext) {
+    const plane = this.activePlane;
+    const center = this.center;
+    const radius = this.radius;
+    const startAngleRad = this.startAngleRad;
+    const sweepDeg = this.effectiveSweepDeg();
+    this.reset(ctx);
+    if (!plane || !center || radius === null || startAngleRad === null) return;
+    if (Math.abs(sweepDeg) < 1e-3 || Math.abs(sweepDeg) > 359.5) return;
+    const segments = DrawArcTool.segmentsForSweep(sweepDeg);
+    const startAngleDeg = THREE.MathUtils.radToDeg(startAngleRad);
+    void documentStore.drawArc(
+      [plane.origin.x, plane.origin.y, plane.origin.z],
+      [plane.normal.x, plane.normal.y, plane.normal.z],
+      [center.x, center.y],
+      radius,
+      startAngleDeg,
+      sweepDeg,
+      segments,
+      plane.faceId ?? undefined,
+    );
+    this.onCommitted?.();
+  }
+
+  private reset(ctx: ToolContext) {
+    this.activePlane = null;
+    this.center = null;
+    this.currentUv = null;
+    this.radius = null;
+    this.startAngleRad = null;
+    this.numeric.clear();
+    this.preview.clear(ctx.scene);
+    this.snapIndicator.hide();
+    measurementHud.hide();
+  }
+}
+
 /// Click-per-vertex polygon tool (SketchUp's "Line" tool, but oriented
 /// around building a closed face rather than one edge at a time): each
 /// click adds a point on the locked sketch plane; clicking back near the
