@@ -267,6 +267,15 @@ class DocumentStore {
   exportStl(path: string) {
     return this.enqueue(() => invoke<void>("export_stl", { path }));
   }
+
+  /// Moves every disconnected printable solid onto a floor-aligned,
+  /// non-overlapping grid - see `Document::arrange_for_print` on the Rust
+  /// side. Rejects (like `exportStl`) if there's nothing printable yet.
+  arrangeForPrint() {
+    return this.enqueue(async () => {
+      this.apply(await invoke<DocumentSnapshot>("arrange_for_print"));
+    });
+  }
 }
 
 export const documentStore = new DocumentStore();

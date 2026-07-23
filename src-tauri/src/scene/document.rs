@@ -18,6 +18,11 @@ new_key_type! {
     pub struct GroupId;
 }
 
+/// Gap (mm) left between each part's bounding box when `arrange_for_print`
+/// lays them out on a grid - matches the ground grid's 10mm cell convention
+/// (see CLAUDE.md's "1 world unit = 1mm" note).
+const PRINT_ARRANGE_SPACING: f64 = 10.0;
+
 /// A simple named collection of faces, moved/renamed together. No shared
 /// component-definition/instance system - each group just owns its faces
 /// directly, which is enough for one-off spaceship parts (hull, wing, ...).
@@ -514,6 +519,67 @@ impl Document {
     /// the actual solids.
     pub fn solid_boundary_face_ids(&self) -> Vec<FaceId> {
         self.mesh.faces.keys().filter(|id| self.solid_face_ids.contains(id)).collect()
+    }
+
+    /// Moves every disconnected solid onto a non-overlapping grid in the XY
+    /// plane, floor-aligned (each solid's lowest point lands at z=0) - a
+    /// one-click "prepare for print" step. Each connected component of
+    /// `solid_boundary_face_ids()` (see `Mesh::connected_components`) is
+    /// treated as one printable part; flat, un-extruded sketch faces are
+    /// excluded, same scoping as `export_stl`. A no-op if there's nothing
+    /// printable.
+    ///
+    /// Every grid cell is sized to the *largest* part's footprint plus
+    /// `PRINT_ARRANGE_SPACING`, so every part's own bounding box - which is
+    /// no larger than that cell - fits entirely within the cell it's
+    /// centered in. Since cells themselves sit on a regular, non-overlapping
+    /// lattice, parts can never overlap regardless of their individual
+    /// sizes or shapes. This is a simple correctness-first uniform grid, not
+    /// a space-efficient bin-packing.
+    pub fn arrange_for_print(&mut self) {
+        let solid_ids = self.solid_boundary_face_ids();
+        let components = self.mesh.connected_components(&solid_ids);
+        if components.is_empty() {
+            return;
+        }
+
+        struct Part {
+            face_ids: Vec<FaceId>,
+            min: DVec3,
+            max: DVec3,
+        }
+        let mut parts: Vec<Part> = components
+            .into_iter()
+            .map(|face_ids| {
+                let (min, max) = self.mesh.bounding_box(&face_ids);
+                Part { face_ids, min, max }
+            })
+            .collect();
+
+        // Deterministic reading-order placement - SlotMap iteration order
+        // isn't guaranteed stable across edits.
+        parts.sort_by(|a, b| {
+            a.min.y.partial_cmp(&b.min.y).unwrap().then(a.min.x.partial_cmp(&b.min.x).unwrap())
+        });
+
+        let cols = (parts.len() as f64).sqrt().ceil() as usize;
+        let cell_x = parts.iter().map(|p| p.max.x - p.min.x).fold(0.0, f64::max) + PRINT_ARRANGE_SPACING;
+        let cell_y = parts.iter().map(|p| p.max.y - p.min.y).fold(0.0, f64::max) + PRINT_ARRANGE_SPACING;
+
+        for (i, part) in parts.iter().enumerate() {
+            let col = i % cols;
+            let row = i / cols;
+            let target_center_x = col as f64 * cell_x;
+            let target_center_y = row as f64 * cell_y;
+            let current_center_x = (part.min.x + part.max.x) / 2.0;
+            let current_center_y = (part.min.y + part.max.y) / 2.0;
+            let delta = DVec3::new(
+                target_center_x - current_center_x,
+                target_center_y - current_center_y,
+                -part.min.z,
+            );
+            self.translate_faces(&part.face_ids, delta);
+        }
     }
 
     /// Builds the full render/selection payload sent to the frontend after
@@ -1393,5 +1459,77 @@ mod tests {
         for (a, b) in original_positions.iter().zip(reloaded_positions.iter()) {
             assert!((*a - *b).length() < 1e-9);
         }
+    }
+
+    /// Draws a `size` x `size` box on the plane z = `z0` and pushes/pulls it
+    /// by `height` (may be negative), for `arrange_for_print` tests below.
+    fn make_box(doc: &mut Document, origin_xy: DVec2, size: f64, z0: f64, height: f64) -> Vec<FaceId> {
+        let plane = Plane::from_normal(DVec3::new(0.0, 0.0, z0), DVec3::Z);
+        let sketch_id = doc.draw_rectangle(&plane, origin_xy, origin_xy + DVec2::new(size, size), None)[0];
+        doc.push_pull(sketch_id, height)
+    }
+
+    fn xy_overlaps(a: (DVec3, DVec3), b: (DVec3, DVec3)) -> bool {
+        a.0.x < b.1.x && a.1.x > b.0.x && a.0.y < b.1.y && a.1.y > b.0.y
+    }
+
+    #[test]
+    fn arrange_for_print_floors_and_separates_two_overlapping_boxes() {
+        let mut doc = Document::new();
+        // Same XY footprint (fully overlapping), one raised above the
+        // ground, one with its cap left below z=0 - both must end up
+        // floor-aligned and side by side, not overlapping.
+        make_box(&mut doc, DVec2::new(0.0, 0.0), 2.0, 5.0, 2.0); // z in [5, 7]
+        make_box(&mut doc, DVec2::new(0.0, 0.0), 2.0, 0.0, -3.0); // z in [-3, 0]
+
+        doc.arrange_for_print();
+
+        let solids = doc.solid_boundary_face_ids();
+        let components = doc.mesh.connected_components(&solids);
+        assert_eq!(components.len(), 2);
+
+        let boxes: Vec<(DVec3, DVec3)> = components.iter().map(|c| doc.mesh.bounding_box(c)).collect();
+        for (min, _) in &boxes {
+            assert!(min.z.abs() < 1e-9, "part must be floor-aligned, got min.z = {}", min.z);
+        }
+        assert!(!xy_overlaps(boxes[0], boxes[1]), "arranged parts must not overlap in XY: {boxes:?}");
+    }
+
+    #[test]
+    fn arrange_for_print_has_no_pairwise_overlap_across_varied_part_sizes() {
+        let mut doc = Document::new();
+        // All at the same overlapping XY origin, deliberately different
+        // sizes - exercises the uniform-grid-cell overlap guarantee, not
+        // just a coincidence of two equal-sized boxes.
+        make_box(&mut doc, DVec2::new(0.0, 0.0), 1.0, 0.0, 1.0);
+        make_box(&mut doc, DVec2::new(0.0, 0.0), 8.0, 0.0, 1.0);
+        make_box(&mut doc, DVec2::new(0.0, 0.0), 3.0, 0.0, 1.0);
+        make_box(&mut doc, DVec2::new(0.0, 0.0), 1.5, 0.0, 1.0);
+
+        doc.arrange_for_print();
+
+        let solids = doc.solid_boundary_face_ids();
+        let components = doc.mesh.connected_components(&solids);
+        assert_eq!(components.len(), 4);
+        let boxes: Vec<(DVec3, DVec3)> = components.iter().map(|c| doc.mesh.bounding_box(c)).collect();
+
+        for i in 0..boxes.len() {
+            for j in (i + 1)..boxes.len() {
+                assert!(!xy_overlaps(boxes[i], boxes[j]), "parts {i} and {j} overlap: {:?} vs {:?}", boxes[i], boxes[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn arrange_for_print_is_a_noop_with_no_printable_solids() {
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::new(0.0, 0.0, 5.0), DVec3::Z);
+        doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0), None);
+        let positions_before: Vec<DVec3> = doc.mesh.vertices.values().map(|v| v.position).collect();
+
+        doc.arrange_for_print();
+
+        let positions_after: Vec<DVec3> = doc.mesh.vertices.values().map(|v| v.position).collect();
+        assert_eq!(positions_before, positions_after, "a flat, un-extruded sketch must be left untouched");
     }
 }

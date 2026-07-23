@@ -71,8 +71,9 @@ Other controls:
     shows the running **total dry mass**. Volume is computed from the model geometry; hollow parts
     (thin-walled hulls, tanks) are treated as solid and so read heavy. Material and scale choices
     persist between sessions (stored locally, not in the project file).
-- **File menu**: save/open a project, and export STL (export is blocked if the model isn't a
-  watertight, printable solid).
+- **File menu**: save/open a project, export STL (blocked if the model isn't a watertight,
+  printable solid), and **Arrange for Print** (moves every printable solid onto a floor-aligned,
+  non-overlapping grid, ready to slice; flat sketches are left alone).
 
 ## Development
 

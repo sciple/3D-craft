@@ -25,7 +25,12 @@ export function createFileMenu(container: HTMLElement) {
   exportButton.innerHTML = icons.exportStl;
   exportButton.addEventListener("click", () => void handleExportStl());
 
-  bar.append(saveButton, openButton, exportButton);
+  const arrangeButton = document.createElement("button");
+  arrangeButton.title = "Arrange for Print";
+  arrangeButton.innerHTML = icons.arrangeForPrint;
+  arrangeButton.addEventListener("click", () => void handleArrangeForPrint());
+
+  bar.append(saveButton, openButton, exportButton, arrangeButton);
   container.appendChild(bar);
 }
 
@@ -68,5 +73,13 @@ async function handleExportStl() {
     await documentStore.exportStl(path);
   } catch (err) {
     alert(`Couldn't export STL: ${err}`);
+  }
+}
+
+async function handleArrangeForPrint() {
+  try {
+    await documentStore.arrangeForPrint();
+  } catch (err) {
+    alert(`Couldn't arrange parts: ${err}`);
   }
 }

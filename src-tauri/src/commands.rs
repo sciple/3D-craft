@@ -285,6 +285,25 @@ pub fn load_project(state: State<AppState>, path: String) -> Result<DocumentSnap
     Ok(history.document.snapshot())
 }
 
+/// Moves every disconnected printable solid onto a floor-aligned,
+/// non-overlapping grid (see `Document::arrange_for_print`) - a one-click
+/// "prepare for print" step. Errors the same way `export_stl` does when
+/// there's nothing printable yet, rather than silently doing nothing.
+#[tauri::command]
+pub fn arrange_for_print(state: State<AppState>) -> Result<DocumentSnapshot, String> {
+    let mut history = state.0.lock().unwrap();
+    if history.document.solid_boundary_face_ids().is_empty() {
+        return Err(
+            "Nothing printable to arrange yet - flat sketches have no thickness. Use Push/Pull to \
+             turn them into solids first."
+                .to_string(),
+        );
+    }
+    history.record();
+    history.document.arrange_for_print();
+    Ok(history.document.snapshot())
+}
+
 /// Exports the document's solids to a binary STL file at `path`. Flat
 /// sketch faces are skipped (zero thickness - unprintable by definition),
 /// so a leftover construction sketch never blocks exporting the finished
