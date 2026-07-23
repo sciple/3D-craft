@@ -13,7 +13,7 @@ export function createFileMenu(container: HTMLElement) {
   const saveButton = document.createElement("button");
   saveButton.title = "Save Project";
   saveButton.innerHTML = icons.save;
-  saveButton.addEventListener("click", () => void handleSave());
+  saveButton.addEventListener("click", () => void promptSaveProject());
 
   const openButton = document.createElement("button");
   openButton.title = "Open Project";
@@ -34,17 +34,22 @@ export function createFileMenu(container: HTMLElement) {
   container.appendChild(bar);
 }
 
-async function handleSave() {
+/// Exported so `ui/close-guard.ts` can reuse the exact same save flow (and
+/// know whether it actually succeeded) when the user picks "Save" from the
+/// unsaved-changes prompt on window close.
+export async function promptSaveProject(): Promise<boolean> {
   const path = await save({
     title: "Save Project",
     defaultPath: "project.json",
     filters: [{ name: "3D Craft Project", extensions: ["json"] }],
   });
-  if (!path) return;
+  if (!path) return false;
   try {
     await documentStore.saveProject(path);
+    return true;
   } catch (err) {
     alert(`Couldn't save the project: ${err}`);
+    return false;
   }
 }
 

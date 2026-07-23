@@ -48,6 +48,13 @@ const EMPTY_SNAPSHOT: DocumentSnapshot = { vertices: [], faces: [], groups: [], 
 class DocumentStore {
   private snapshot: DocumentSnapshot = EMPTY_SNAPSHOT;
   private listeners = new Set<Listener>();
+  // Tracks whether the document has changes not yet written to a project
+  // file - drives the close-guard's Save/Discard/Cancel prompt (see
+  // ui/close-guard.ts). Only commands that touch persisted content
+  // (ProjectFile stores vertices/faces/groups, not selection) should mark
+  // this true - see `applyEdit` vs. the plain `apply` used by
+  // selectFaces/selectGroup/refresh.
+  private dirty = false;
   // Every command is chained through this so they execute (and apply their
   // resulting snapshot) in strict call order, never overlapping. Without
   // this, two commands fired in quick succession (e.g. a draw click
@@ -68,6 +75,10 @@ class DocumentStore {
     return this.snapshot;
   }
 
+  isDirty(): boolean {
+    return this.dirty;
+  }
+
   subscribe(listener: Listener): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -78,6 +89,14 @@ class DocumentStore {
     for (const listener of this.listeners) listener(snapshot);
   }
 
+  /// Same as `apply`, but also marks the document dirty - use for every
+  /// command that changes persisted content (geometry/groups), never for
+  /// selection-only commands.
+  private applyEdit(snapshot: DocumentSnapshot) {
+    this.dirty = true;
+    this.apply(snapshot);
+  }
+
   refresh() {
     return this.enqueue(async () => {
       this.apply(await invoke<DocumentSnapshot>("get_document"));
@@ -86,13 +105,13 @@ class DocumentStore {
 
   undo() {
     return this.enqueue(async () => {
-      this.apply(await invoke<DocumentSnapshot>("undo"));
+      this.applyEdit(await invoke<DocumentSnapshot>("undo"));
     });
   }
 
   redo() {
     return this.enqueue(async () => {
-      this.apply(await invoke<DocumentSnapshot>("redo"));
+      this.applyEdit(await invoke<DocumentSnapshot>("redo"));
     });
   }
 
@@ -103,7 +122,7 @@ class DocumentStore {
   /// side.
   drawRectangle(planeOrigin: Vec3, planeNormal: Vec3, cornerA: Vec2, cornerB: Vec2, targetFaceId?: FaceId) {
     return this.enqueue(async () => {
-      this.apply(
+      this.applyEdit(
         await invoke<DocumentSnapshot>("draw_rectangle", {
           planeOrigin,
           planeNormal,
@@ -117,7 +136,7 @@ class DocumentStore {
 
   drawCircle(planeOrigin: Vec3, planeNormal: Vec3, center: Vec2, radius: number, segments: number, targetFaceId?: FaceId) {
     return this.enqueue(async () => {
-      this.apply(
+      this.applyEdit(
         await invoke<DocumentSnapshot>("draw_circle", {
           planeOrigin,
           planeNormal,
@@ -145,7 +164,7 @@ class DocumentStore {
     targetFaceId?: FaceId,
   ) {
     return this.enqueue(async () => {
-      this.apply(
+      this.applyEdit(
         await invoke<DocumentSnapshot>("draw_arc", {
           planeOrigin,
           planeNormal,
@@ -162,7 +181,7 @@ class DocumentStore {
 
   drawPolygon(planeOrigin: Vec3, planeNormal: Vec3, points: Vec2[], targetFaceId?: FaceId) {
     return this.enqueue(async () => {
-      this.apply(
+      this.applyEdit(
         await invoke<DocumentSnapshot>("draw_polygon", {
           planeOrigin,
           planeNormal,
@@ -175,49 +194,49 @@ class DocumentStore {
 
   pushPullFace(faceId: FaceId, distance: number) {
     return this.enqueue(async () => {
-      this.apply(await invoke<DocumentSnapshot>("push_pull_face", { faceId, distance }));
+      this.applyEdit(await invoke<DocumentSnapshot>("push_pull_face", { faceId, distance }));
     });
   }
 
   pushPullFaces(faceIds: FaceId[], distance: number) {
     return this.enqueue(async () => {
-      this.apply(await invoke<DocumentSnapshot>("push_pull_faces", { faceIds, distance }));
+      this.applyEdit(await invoke<DocumentSnapshot>("push_pull_faces", { faceIds, distance }));
     });
   }
 
   insetFace(faceId: FaceId, offset: number) {
     return this.enqueue(async () => {
-      this.apply(await invoke<DocumentSnapshot>("inset_face", { faceId, offset }));
+      this.applyEdit(await invoke<DocumentSnapshot>("inset_face", { faceId, offset }));
     });
   }
 
   eraseFace(faceId: FaceId) {
     return this.enqueue(async () => {
-      this.apply(await invoke<DocumentSnapshot>("erase_face", { faceId }));
+      this.applyEdit(await invoke<DocumentSnapshot>("erase_face", { faceId }));
     });
   }
 
   moveFaces(faceIds: FaceId[], delta: Vec3) {
     return this.enqueue(async () => {
-      this.apply(await invoke<DocumentSnapshot>("move_faces", { faceIds, delta }));
+      this.applyEdit(await invoke<DocumentSnapshot>("move_faces", { faceIds, delta }));
     });
   }
 
   rotateFaces(faceIds: FaceId[], pivot: Vec3, axis: Vec3, angleRadians: number) {
     return this.enqueue(async () => {
-      this.apply(await invoke<DocumentSnapshot>("rotate_faces", { faceIds, pivot, axis, angleRadians }));
+      this.applyEdit(await invoke<DocumentSnapshot>("rotate_faces", { faceIds, pivot, axis, angleRadians }));
     });
   }
 
   scaleFaces(faceIds: FaceId[], pivot: Vec3, scale: Vec3) {
     return this.enqueue(async () => {
-      this.apply(await invoke<DocumentSnapshot>("scale_faces", { faceIds, pivot, scale }));
+      this.applyEdit(await invoke<DocumentSnapshot>("scale_faces", { faceIds, pivot, scale }));
     });
   }
 
   duplicateFaces(faceIds: FaceId[], delta: Vec3) {
     return this.enqueue(async () => {
-      this.apply(await invoke<DocumentSnapshot>("duplicate_faces", { faceIds, delta }));
+      this.applyEdit(await invoke<DocumentSnapshot>("duplicate_faces", { faceIds, delta }));
     });
   }
 
@@ -226,19 +245,19 @@ class DocumentStore {
   /// `Document::mirror_faces` for why a copy (matches SketchUp's Mirror).
   mirrorFaces(faceIds: FaceId[], axis: "x" | "y" | "z", pivot: Vec3) {
     return this.enqueue(async () => {
-      this.apply(await invoke<DocumentSnapshot>("mirror_faces", { faceIds, axis, pivot }));
+      this.applyEdit(await invoke<DocumentSnapshot>("mirror_faces", { faceIds, axis, pivot }));
     });
   }
 
   groupFaces(faceIds: FaceId[], name: string) {
     return this.enqueue(async () => {
-      this.apply(await invoke<DocumentSnapshot>("group_faces", { faceIds, name }));
+      this.applyEdit(await invoke<DocumentSnapshot>("group_faces", { faceIds, name }));
     });
   }
 
   ungroup(groupId: GroupId) {
     return this.enqueue(async () => {
-      this.apply(await invoke<DocumentSnapshot>("ungroup", { groupId }));
+      this.applyEdit(await invoke<DocumentSnapshot>("ungroup", { groupId }));
     });
   }
 
@@ -255,12 +274,16 @@ class DocumentStore {
   }
 
   saveProject(path: string) {
-    return this.enqueue(() => invoke<void>("save_project", { path }));
+    return this.enqueue(async () => {
+      await invoke<void>("save_project", { path });
+      this.dirty = false;
+    });
   }
 
   loadProject(path: string) {
     return this.enqueue(async () => {
       this.apply(await invoke<DocumentSnapshot>("load_project", { path }));
+      this.dirty = false;
     });
   }
 
@@ -273,7 +296,7 @@ class DocumentStore {
   /// side. Rejects (like `exportStl`) if there's nothing printable yet.
   arrangeForPrint() {
     return this.enqueue(async () => {
-      this.apply(await invoke<DocumentSnapshot>("arrange_for_print"));
+      this.applyEdit(await invoke<DocumentSnapshot>("arrange_for_print"));
     });
   }
 }

@@ -16,6 +16,7 @@ import { createToolbar } from "./ui/toolbar";
 import { createOutliner } from "./ui/outliner";
 import { createPartsCatalog } from "./ui/parts-catalog";
 import { createFileMenu } from "./ui/file-menu";
+import { installCloseGuard } from "./ui/close-guard";
 import { icons } from "./ui/icons";
 
 window.addEventListener("DOMContentLoaded", async () => {
@@ -65,6 +66,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   createOutliner(uiRootEl);
   createPartsCatalog(uiRootEl);
   createFileMenu(uiRootEl);
+  installCloseGuard();
 
   documentStore.subscribe((snapshot) => meshRenderer.update(snapshot));
   await documentStore.refresh();

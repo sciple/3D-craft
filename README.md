@@ -74,6 +74,8 @@ Other controls:
 - **File menu**: save/open a project, export STL (blocked if the model isn't a watertight,
   printable solid), and **Arrange for Print** (moves every printable solid onto a floor-aligned,
   non-overlapping grid, ready to slice; flat sketches are left alone).
+- **Closing the window**: if there are unsaved changes, closing prompts to **Save**, **Discard**,
+  or **Cancel** instead of silently quitting.
 
 ## Development
 
