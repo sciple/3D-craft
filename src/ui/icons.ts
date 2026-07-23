@@ -11,6 +11,7 @@ export const icons = {
   rectangle: svg(`<rect x="4" y="6" width="16" height="12" rx="1"/>`),
   circle: svg(`<circle cx="12" cy="12" r="8"/>`),
   polygon: svg(`<path d="M12 3l8 6-3 10H7L4 9z"/>`),
+  ngon: svg(`<path d="M12 3l7.8 4.5v9L12 21l-7.8-4.5v-9z"/>`),
   arc: svg(`<path d="M12 12V4a8 8 0 0 1 8 8z"/>`),
   pushPull: svg(`<path d="M12 2.5v9.5M12 2.5l-3 3M12 2.5l3 3"/><rect x="5" y="14" width="14" height="7.5"/>`),
   inset: svg(`<rect x="4" y="4" width="16" height="16" rx="1"/><rect x="9.5" y="9.5" width="5" height="5"/>`),

@@ -280,6 +280,171 @@ export class DrawCircleTool implements Tool {
   }
 }
 
+/// Click-click regular-polygon tool (5-8 sides): first click resolves the
+/// sketch plane and sets the center (like Circle); second click sets BOTH
+/// the radius and the rotation from the vector center->click point, so one
+/// vertex lands exactly under the cursor (SketchUp's polygon convention,
+/// and the same "click defines a vertex" idea `DrawArcTool` uses for its
+/// start angle). Side count defaults to 6 and is changed with Arrow
+/// Up/Down while the tool is active - arrow keys pass straight through
+/// `NumericBuffer.type()` untouched, so there's no conflict with a typed
+/// radius override.
+export class DrawNgonTool implements Tool {
+  readonly name = "ngon";
+  private static readonly MIN_SIDES = 5;
+  private static readonly MAX_SIDES = 8;
+  private static readonly SIDE_NAMES: Record<number, string> = {
+    5: "Pentagon",
+    6: "Hexagon",
+    7: "Heptagon",
+    8: "Octagon",
+  };
+
+  private raycaster = new THREE.Raycaster();
+  private activePlane: SketchPlane | null = null;
+  private center: THREE.Vector2 | null = null;
+  private currentUv: THREE.Vector2 | null = null;
+  private sides = 6;
+  private numeric = new NumericBuffer();
+  private preview = new PreviewLine();
+  private snapIndicator = new SnapIndicator();
+
+  constructor(private onCommitted?: () => void) {}
+
+  activate() {
+    this.activePlane = null;
+    this.center = null;
+    this.currentUv = null;
+    this.sides = 6;
+    this.numeric.clear();
+  }
+
+  deactivate(ctx: ToolContext) {
+    this.reset(ctx);
+  }
+
+  onPointerDown(e: PointerEvent, ctx: ToolContext) {
+    if (e.button !== 0) return;
+
+    if (!this.activePlane) {
+      const target = resolveSketchTarget(e, ctx, this.raycaster);
+      if (!target) return;
+      const snap = findPlanarSnap(documentStore.getSnapshot(), target.point, target.plane, ctx.camera, ctx.domElement);
+      const point = snap ? snap.point : target.point;
+      this.activePlane = target.plane;
+      this.center = to2d(target.plane, point);
+      this.currentUv = this.center.clone();
+      return;
+    }
+
+    this.commit(ctx);
+  }
+
+  onPointerMove(e: PointerEvent, ctx: ToolContext) {
+    if (!this.activePlane) {
+      const target = resolveSketchTarget(e, ctx, this.raycaster);
+      if (!target) return;
+      const snap = findPlanarSnap(documentStore.getSnapshot(), target.point, target.plane, ctx.camera, ctx.domElement);
+      this.snapIndicator.update(ctx.scene, ctx.camera, snap);
+      return;
+    }
+
+    const hit = raycastPlaneSnapped(e, ctx, this.raycaster, this.activePlane);
+    if (!hit) return;
+    this.snapIndicator.update(ctx.scene, ctx.camera, hit.snap);
+    this.currentUv = to2d(this.activePlane, hit.point);
+    this.updatePreview(ctx);
+  }
+
+  onKeyDown(e: KeyboardEvent, ctx: ToolContext) {
+    if (this.activePlane && this.center) {
+      if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+        const delta = e.key === "ArrowUp" ? 1 : -1;
+        this.sides = THREE.MathUtils.clamp(this.sides + delta, DrawNgonTool.MIN_SIDES, DrawNgonTool.MAX_SIDES);
+        this.updatePreview(ctx);
+        return;
+      }
+      if (e.key === "Enter") {
+        if (!this.numeric.isEmpty) this.commit(ctx);
+        return;
+      }
+      if (e.key === "Escape" && !this.numeric.isEmpty) {
+        this.numeric.clear();
+        this.updatePreview(ctx);
+        return;
+      }
+      if (this.numeric.type(e)) {
+        this.updatePreview(ctx);
+        return;
+      }
+    }
+    if (e.key === "Escape") {
+      this.reset(ctx);
+    }
+  }
+
+  private effectiveRadius(): number | null {
+    if (!this.center || !this.currentUv) return null;
+    if (this.numeric.isEmpty) return this.center.distanceTo(this.currentUv);
+    const r = this.numeric.values()[0];
+    return r === undefined ? this.center.distanceTo(this.currentUv) : r;
+  }
+
+  /// Rotation always follows the mouse, even when the radius is typed -
+  /// mirrors `DrawArcTool.currentAngleRad`.
+  private currentAngleRad(): number {
+    if (!this.center || !this.currentUv) return 0;
+    return Math.atan2(this.currentUv.y - this.center.y, this.currentUv.x - this.center.x);
+  }
+
+  private updatePreview(ctx: ToolContext) {
+    const plane = this.activePlane;
+    const center = this.center;
+    const radius = this.effectiveRadius();
+    if (!plane || !center || radius === null) return;
+    const startAngle = this.currentAngleRad();
+    const points: THREE.Vector3[] = [];
+    for (let i = 0; i <= this.sides; i++) {
+      const angle = startAngle + (i / this.sides) * Math.PI * 2;
+      points.push(to3d(plane, new THREE.Vector2(center.x + Math.cos(angle) * radius, center.y + Math.sin(angle) * radius)));
+    }
+    this.preview.update(ctx.scene, points);
+    const name = DrawNgonTool.SIDE_NAMES[this.sides] ?? `${this.sides}-gon`;
+    measurementHud.show(`${name} radius (↑↓ sides)`, `${radius.toFixed(1)} mm`, this.numeric.isEmpty ? null : this.numeric.display);
+  }
+
+  private commit(ctx: ToolContext) {
+    const plane = this.activePlane;
+    const center = this.center;
+    const radius = this.effectiveRadius();
+    const startAngleDeg = THREE.MathUtils.radToDeg(this.currentAngleRad());
+    const sides = this.sides;
+    this.reset(ctx);
+    if (!plane || !center || radius === null || radius < 1e-6) return;
+    void documentStore.drawNgon(
+      [plane.origin.x, plane.origin.y, plane.origin.z],
+      [plane.normal.x, plane.normal.y, plane.normal.z],
+      [center.x, center.y],
+      radius,
+      sides,
+      startAngleDeg,
+      plane.faceId ?? undefined,
+    );
+    this.onCommitted?.();
+  }
+
+  private reset(ctx: ToolContext) {
+    this.activePlane = null;
+    this.center = null;
+    this.currentUv = null;
+    this.sides = 6;
+    this.numeric.clear();
+    this.preview.clear(ctx.scene);
+    this.snapIndicator.hide();
+    measurementHud.hide();
+  }
+}
+
 /// Click-click-click arc tool: first click resolves the sketch plane and
 /// sets the center (like Circle); second click sets the radius and start
 /// angle (a typed number overrides the radius, mirroring

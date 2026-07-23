@@ -46,6 +46,7 @@ to set an exact value (mm, or degrees for Rotate) and press **Enter** to commit;
 | Rectangle | `R` | Draw a rectangle on the ground or on an existing face. |
 | Circle | `C` | Draw a circle. |
 | Arc | `A` | Click center, click to set radius, click (or type degrees) to set the sweep. Closes with a straight chord - a 180° arc is a half-pipe cross-section. |
+| N-Gon | `N` | Click center, click to set radius and rotation (one vertex lands under the cursor). Press `↑`/`↓` to change the side count (5-8, default 6) before committing. |
 | Polygon | `L` | Click points to draw a closed polygon. |
 | Push/Pull | `P` | Drag a face along its normal to extrude a solid (or carve inward). |
 | Inset | `I` | Offset a face's border inward. |

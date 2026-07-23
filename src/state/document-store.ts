@@ -179,6 +179,33 @@ class DocumentStore {
     });
   }
 
+  /// `startAngleDeg`: rotation of the polygon's first vertex, mirroring
+  /// `drawArc`'s convention - the tool derives it from the click that sets
+  /// the radius, so one vertex lands under the cursor.
+  drawNgon(
+    planeOrigin: Vec3,
+    planeNormal: Vec3,
+    center: Vec2,
+    radius: number,
+    sides: number,
+    startAngleDeg: number,
+    targetFaceId?: FaceId,
+  ) {
+    return this.enqueue(async () => {
+      this.applyEdit(
+        await invoke<DocumentSnapshot>("draw_ngon", {
+          planeOrigin,
+          planeNormal,
+          center,
+          radius,
+          sides,
+          startAngleDeg,
+          targetFaceId: targetFaceId ?? null,
+        }),
+      );
+    });
+  }
+
   drawPolygon(planeOrigin: Vec3, planeNormal: Vec3, points: Vec2[], targetFaceId?: FaceId) {
     return this.enqueue(async () => {
       this.applyEdit(

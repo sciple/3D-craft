@@ -18,6 +18,7 @@ pub fn run() {
             commands::draw_rectangle,
             commands::draw_circle,
             commands::draw_arc,
+            commands::draw_ngon,
             commands::draw_polygon,
             commands::push_pull_face,
             commands::push_pull_faces,

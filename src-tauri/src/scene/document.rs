@@ -113,6 +113,25 @@ impl Document {
         self.resplit(plane, new_loop, target_face_id)
     }
 
+    /// Draws a regular polygon (5-8 sides, the N-Gon tool) - see
+    /// `primitives::add_ngon`. `start_angle_deg` sets the rotation (the
+    /// tool derives it from the click that sets the radius, so one vertex
+    /// lands under the cursor).
+    pub fn draw_ngon(
+        &mut self,
+        plane: &Plane,
+        center: DVec2,
+        radius: f64,
+        sides: usize,
+        start_angle_deg: f64,
+        target_face_id: Option<FaceId>,
+    ) -> Vec<FaceId> {
+        let temp_face_id = primitives::add_ngon(&mut self.mesh, plane, center, radius, sides, start_angle_deg);
+        let new_loop = self.mesh.faces[temp_face_id].outer.clone();
+        self.mesh.remove_face(temp_face_id);
+        self.resplit(plane, new_loop, target_face_id)
+    }
+
     /// Draws a closed polygon from explicit click points (the Polygon/Line
     /// tool). Point winding doesn't matter: resplit_plane's face_detect pass
     /// re-derives correct orientation from the undirected edge graph either
@@ -984,6 +1003,29 @@ mod tests {
         let ring_id = doc.mesh.faces.iter().next().unwrap().0;
         let new_faces = doc.push_pull(ring_id, 3.0);
         assert!(pushpull::is_manifold(&doc.mesh, &new_faces), "extruded ring should be a hollow, watertight tube");
+    }
+
+    #[test]
+    fn draw_ngon_creates_a_pushable_hexagon() {
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let face_id = doc.draw_ngon(&plane, DVec2::ZERO, 5.0, 6, 0.0, None)[0];
+        assert_eq!(doc.mesh.faces[face_id].outer.len(), 6);
+
+        let new_faces = doc.push_pull(face_id, 3.0);
+        assert!(pushpull::is_manifold(&doc.mesh, &new_faces), "extruded hexagon should be a watertight solid");
+    }
+
+    #[test]
+    fn drawing_an_ngon_inside_a_circle_auto_splits_into_ring_and_inner_face() {
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        doc.draw_circle(&plane, DVec2::ZERO, 5.0, 16, None);
+        doc.draw_ngon(&plane, DVec2::ZERO, 2.0, 6, 0.0, None);
+
+        assert_eq!(doc.mesh.faces.len(), 2);
+        let faces_with_holes = doc.mesh.faces.values().filter(|f| !f.holes.is_empty()).count();
+        assert_eq!(faces_with_holes, 1, "exactly one face (the outer ring) should have a hole");
     }
 
     #[test]

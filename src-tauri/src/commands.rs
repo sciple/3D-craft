@@ -133,6 +133,24 @@ pub fn draw_arc(
 }
 
 #[tauri::command]
+pub fn draw_ngon(
+    state: State<AppState>,
+    plane_origin: DVec3,
+    plane_normal: DVec3,
+    center: DVec2,
+    radius: f64,
+    sides: u32,
+    start_angle_deg: f64,
+    target_face_id: Option<FaceId>,
+) -> DocumentSnapshot {
+    let mut history = state.0.lock().unwrap();
+    history.record();
+    let plane = Plane::from_normal(plane_origin, plane_normal);
+    history.document.draw_ngon(&plane, center, radius, sides as usize, start_angle_deg, target_face_id);
+    history.document.snapshot()
+}
+
+#[tauri::command]
 pub fn draw_polygon(
     state: State<AppState>,
     plane_origin: DVec3,

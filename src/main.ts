@@ -5,7 +5,7 @@ import { documentStore } from "./state/document-store";
 import { ToolManager } from "./tools/tool-manager";
 import type { ToolContext } from "./tools/types";
 import { SelectTool } from "./tools/select-tool";
-import { DrawRectangleTool, DrawCircleTool, DrawArcTool, DrawPolygonTool } from "./tools/draw-tool";
+import { DrawRectangleTool, DrawCircleTool, DrawArcTool, DrawNgonTool, DrawPolygonTool } from "./tools/draw-tool";
 import { PushPullTool } from "./tools/pushpull-tool";
 import { InsetTool } from "./tools/inset-tool";
 import { ScaleTool } from "./tools/scale-tool";
@@ -41,6 +41,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   const rectangleTool = new DrawRectangleTool(returnToSelect);
   const circleTool = new DrawCircleTool(returnToSelect);
   const arcTool = new DrawArcTool(returnToSelect);
+  const ngonTool = new DrawNgonTool(returnToSelect);
   const polygonTool = new DrawPolygonTool(returnToSelect);
   const pushPullTool = new PushPullTool();
   const insetTool = new InsetTool();
@@ -54,6 +55,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     { tool: rectangleTool, label: "Rectangle", shortcut: "r", icon: icons.rectangle },
     { tool: circleTool, label: "Circle", shortcut: "c", icon: icons.circle },
     { tool: arcTool, label: "Arc", shortcut: "a", icon: icons.arc },
+    { tool: ngonTool, label: "N-Gon", shortcut: "n", icon: icons.ngon },
     { tool: polygonTool, label: "Polygon", shortcut: "l", icon: icons.polygon },
     { tool: pushPullTool, label: "Push/Pull", shortcut: "p", icon: icons.pushPull },
     { tool: insetTool, label: "Inset", shortcut: "i", icon: icons.inset },
