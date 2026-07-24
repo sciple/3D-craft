@@ -58,6 +58,8 @@ to set an exact value (mm, or degrees for Rotate) and press **Enter** to commit;
 Other controls:
 
 - **Camera**: orbit, pan, and zoom with the mouse (SketchUp-style), Z-up.
+- **Build plate**: the ground grid is a true-scale 180 × 180 mm print bed in 10 mm cells, centered
+  on the origin; the brighter outline marks the printable boundary.
 - **Undo / Redo**: `Ctrl+Z` / `Ctrl+Y` (or `Ctrl+Shift+Z`).
 - **Outliner** (right panel): manage groups and mirror a copy of the selection across X/Y/Z.
 - **Parts Catalog** (collapsible dropdown, top right): a guided build manifest of spacecraft subsystems (propulsion,

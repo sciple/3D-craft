@@ -28,11 +28,31 @@ export function initViewport(container: HTMLElement) {
   scene.add(dirLight);
 
   // 1 unit = 1 mm throughout this app (STL/slicers assume mm, and it keeps
-  // export unit-conversion-free) - a 100x100mm grid in 10mm cells reads as a
-  // sensible default print-bed-scale reference for small spacecraft parts.
-  const grid = new THREE.GridHelper(100, 10, 0x556677, 0x3a4552);
+  // export unit-conversion-free), so the grid can double as a true-scale
+  // stand-in for the printer's build plate: 180x180 mm in 10 mm cells,
+  // centered on the origin (-90..+90 in X and Y).
+  const BED_SIZE = 180;
+  const BED_CELLS = 18; // 10 mm per cell
+
+  const grid = new THREE.GridHelper(BED_SIZE, BED_CELLS, 0x556677, 0x3a4552);
   grid.rotation.x = Math.PI / 2; // GridHelper defaults to the XZ plane; rotate into XY (our ground plane)
   scene.add(grid);
+
+  // The plate perimeter, drawn brighter than the grid lines so the printable
+  // boundary is unmistakable. WebGL ignores LineBasicMaterial.linewidth, so the
+  // contrast has to come from colour, not thickness. Nudged a hair above z=0 to
+  // avoid z-fighting with the grid's own outermost lines, which are coincident.
+  const half = BED_SIZE / 2;
+  const bedOutline = new THREE.LineLoop(
+    new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(-half, -half, 0.01),
+      new THREE.Vector3(half, -half, 0.01),
+      new THREE.Vector3(half, half, 0.01),
+      new THREE.Vector3(-half, half, 0.01),
+    ]),
+    new THREE.LineBasicMaterial({ color: 0x9db8d8 }),
+  );
+  scene.add(bedOutline);
   scene.add(new THREE.AxesHelper(10)); // red=X, green=Y, blue=Z, matching SketchUp's axis colors
 
   window.addEventListener("resize", () => {
