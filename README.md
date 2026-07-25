@@ -47,7 +47,7 @@ to set an exact value (mm, or degrees for Rotate) and press **Enter** to commit;
 | Circle | `C` | Draw a circle. |
 | Arc | `A` | Click center, click to set radius, click (or type degrees) to set the sweep. Closes with a straight chord - a 180° arc is a half-pipe cross-section. |
 | N-Gon | `N` | Click center, click to set radius and rotation (one vertex lands under the cursor). Press `↑`/`↓` to change the side count (5-8, default 6) before committing. |
-| Polygon | `L` | Click points to draw a closed polygon. |
+| Polygon | `L` | Click points to draw a closed polygon. Hold `Shift` while placing a point to lock the segment to the sketch plane's axes (90° corners). |
 | Push/Pull | `P` | Drag a face along its normal to extrude a solid (or carve inward). |
 | Inset | `I` | Offset a face's border inward. |
 | Scale | `G` | Scale the selection about its center. |

@@ -6,24 +6,8 @@ import { pointerToNdc } from "./types";
 import { closestDistanceAlongAxis } from "./axis-drag";
 import { NumericBuffer } from "./numeric-input";
 import { measurementHud } from "../ui/measurement-hud";
-
-type AxisName = "x" | "y" | "z";
-
-const AXIS_VECTORS: Record<AxisName, THREE.Vector3> = {
-  x: new THREE.Vector3(1, 0, 0),
-  y: new THREE.Vector3(0, 1, 0),
-  z: new THREE.Vector3(0, 0, 1),
-};
-
-// SketchUp's axis colors: red X, green Y, blue Z - shown on the guide line
-// while an axis lock is active so the constraint is visible at a glance.
-const AXIS_COLORS: Record<AxisName, number> = {
-  x: 0xff3b30,
-  y: 0x34c759,
-  z: 0x3a7bff,
-};
-
-const GUIDE_LENGTH = 1000;
+import { AXIS_COLORS, AXIS_VECTORS, GUIDE_LENGTH } from "./axis-constraint";
+import type { AxisName } from "./axis-constraint";
 
 /// Click a face (or, if it's part of the current selection, every selected
 /// face) and drag to translate it. Dragging moves within the horizontal

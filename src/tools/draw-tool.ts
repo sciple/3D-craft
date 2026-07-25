@@ -7,6 +7,7 @@ import type { SketchPlane } from "./plane";
 import { resolveSketchTarget, to2d, to3d } from "./plane";
 import { NumericBuffer } from "./numeric-input";
 import { measurementHud } from "../ui/measurement-hud";
+import { constrainUvToPlaneAxis, guideColorForDirection, GUIDE_LENGTH } from "./axis-constraint";
 
 /// Click-click rectangle tool: first click resolves and locks the sketch
 /// plane (an existing solid face if the click hit one, else the ground
@@ -671,6 +672,15 @@ export class DrawArcTool implements Tool {
 /// direction): Enter with a non-empty typed buffer places that point
 /// without closing the loop; Enter with an empty buffer closes it (the
 /// pre-existing shortcut), matching how a second click behaves either way.
+///
+/// Holding Shift locks the in-progress segment to the sketch plane's own
+/// u/v axes (whichever the cursor is more aligned with), guaranteeing a 90°
+/// corner regardless of how the plane itself is oriented in world space -
+/// see `constrainUvToPlaneAxis`. The lock is read fresh off every pointer
+/// event rather than latched by key state alone, so it self-corrects if a
+/// keyup is missed (e.g. focus loss via alt-tab); `onKeyUp`/`onKeyDown` exist
+/// only to refresh the preview instantly when the modifier changes with the
+/// mouse stationary, mirroring MoveTool's axis-lock guide line.
 export class DrawPolygonTool implements Tool {
   readonly name = "polygon";
   private static readonly CLOSE_DISTANCE_PX = 12;
@@ -680,6 +690,8 @@ export class DrawPolygonTool implements Tool {
   private pointsUv: THREE.Vector2[] = [];
   private currentUv: THREE.Vector2 | null = null;
   private firstClickPixels: { x: number; y: number } | null = null;
+  private shiftHeld = false;
+  private guideLine: THREE.Line | null = null;
   private numeric = new NumericBuffer();
   private preview = new PreviewLine();
   private snapIndicator = new SnapIndicator();
@@ -691,6 +703,7 @@ export class DrawPolygonTool implements Tool {
     this.pointsUv = [];
     this.currentUv = null;
     this.firstClickPixels = null;
+    this.shiftHeld = false;
     this.numeric.clear();
   }
 
@@ -700,6 +713,7 @@ export class DrawPolygonTool implements Tool {
 
   onPointerDown(e: PointerEvent, ctx: ToolContext) {
     if (e.button !== 0) return;
+    this.shiftHeld = e.shiftKey;
 
     if (this.pointsUv.length >= 3 && this.firstClickPixels && this.isNearFirstClick(e)) {
       this.commit(ctx);
@@ -724,10 +738,13 @@ export class DrawPolygonTool implements Tool {
     const next = this.effectiveNextUv();
     if (next) this.pointsUv.push(next);
     this.numeric.clear();
+    this.updateGuideLine(ctx);
     this.updatePreview(ctx);
   }
 
   onPointerMove(e: PointerEvent, ctx: ToolContext) {
+    this.shiftHeld = e.shiftKey;
+
     if (!this.activePlane) {
       const target = resolveSketchTarget(e, ctx, this.raycaster);
       if (!target) return;
@@ -738,12 +755,21 @@ export class DrawPolygonTool implements Tool {
 
     const hit = raycastPlaneSnapped(e, ctx, this.raycaster, this.activePlane);
     if (!hit) return;
-    this.snapIndicator.update(ctx.scene, ctx.camera, hit.snap);
+    // While constrained, the placed point won't land on a free snap - don't
+    // show a marker promising a location the vertex won't actually take.
+    this.snapIndicator.update(ctx.scene, ctx.camera, this.shiftHeld ? null : hit.snap);
     this.currentUv = to2d(this.activePlane, hit.point);
+    this.updateGuideLine(ctx);
     this.updatePreview(ctx);
   }
 
   onKeyDown(e: KeyboardEvent, ctx: ToolContext) {
+    if (e.key === "Shift") {
+      this.shiftHeld = true;
+      this.updateGuideLine(ctx);
+      this.updatePreview(ctx);
+      return;
+    }
     if (this.activePlane && this.pointsUv.length > 0) {
       if (e.key === "Enter" && !this.numeric.isEmpty) {
         const next = this.effectiveNextUv();
@@ -769,6 +795,13 @@ export class DrawPolygonTool implements Tool {
     }
   }
 
+  onKeyUp(e: KeyboardEvent, ctx: ToolContext) {
+    if (e.key !== "Shift") return;
+    this.shiftHeld = false;
+    this.updateGuideLine(ctx);
+    this.updatePreview(ctx);
+  }
+
   private isNearFirstClick(e: PointerEvent): boolean {
     if (!this.firstClickPixels) return false;
     const dx = e.clientX - this.firstClickPixels.x;
@@ -776,14 +809,23 @@ export class DrawPolygonTool implements Tool {
     return Math.sqrt(dx * dx + dy * dy) < DrawPolygonTool.CLOSE_DISTANCE_PX;
   }
 
+  /// Constrains `currentUv` to the sketch plane's own axes (relative to the
+  /// last placed point) when Shift is held, then applies any typed-length
+  /// override to the resulting direction - so a typed length composes with
+  /// the axis lock instead of overriding it.
   private effectiveNextUv(): THREE.Vector2 | null {
     if (!this.currentUv || this.pointsUv.length === 0) return null;
-    if (this.numeric.isEmpty) return this.currentUv;
-    const dist = this.numeric.values()[0];
-    if (dist === undefined) return this.currentUv;
     const last = this.pointsUv[this.pointsUv.length - 1];
-    const dir = this.currentUv.clone().sub(last);
-    if (dir.lengthSq() < 1e-12) return this.currentUv;
+    let target = this.currentUv;
+    if (this.shiftHeld && this.activePlane) {
+      const constrained = constrainUvToPlaneAxis(this.activePlane, last, this.currentUv);
+      if (constrained) target = constrained.uv;
+    }
+    if (this.numeric.isEmpty) return target;
+    const dist = this.numeric.values()[0];
+    if (dist === undefined) return target;
+    const dir = target.clone().sub(last);
+    if (dir.lengthSq() < 1e-12) return target;
     dir.normalize();
     return last.clone().addScaledVector(dir, dist);
   }
@@ -797,8 +839,42 @@ export class DrawPolygonTool implements Tool {
     if (next) {
       const last = this.pointsUv[this.pointsUv.length - 1];
       const length = last.distanceTo(next);
-      measurementHud.show("Segment", `${length.toFixed(1)} mm`, this.numeric.isEmpty ? null : this.numeric.display);
+      const label = this.shiftHeld ? "Segment (⇧ axis)" : "Segment";
+      measurementHud.show(label, `${length.toFixed(1)} mm`, this.numeric.isEmpty ? null : this.numeric.display);
     }
+  }
+
+  /// Shows an axis-colored line through the last placed point along the
+  /// locked plane axis while Shift is held (or removes it otherwise), so the
+  /// active constraint is visible at a glance - mirrors MoveTool's
+  /// updateGuideLine.
+  private updateGuideLine(ctx: ToolContext) {
+    this.removeGuideLine();
+    const plane = this.activePlane;
+    if (!this.shiftHeld || !plane || this.pointsUv.length === 0 || !this.currentUv) return;
+    const last = this.pointsUv[this.pointsUv.length - 1];
+    const constrained = constrainUvToPlaneAxis(plane, last, this.currentUv);
+    if (!constrained) return;
+    const axis = constrained.axis.normalize();
+    const anchor = to3d(plane, last);
+    const a = anchor.clone().addScaledVector(axis, -GUIDE_LENGTH);
+    const b = anchor.clone().addScaledVector(axis, GUIDE_LENGTH);
+    const geometry = new THREE.BufferGeometry().setFromPoints([a, b]);
+    const material = new THREE.LineBasicMaterial({
+      color: guideColorForDirection(axis),
+      transparent: true,
+      opacity: 0.6,
+    });
+    this.guideLine = new THREE.Line(geometry, material);
+    ctx.scene.add(this.guideLine);
+  }
+
+  private removeGuideLine() {
+    if (!this.guideLine) return;
+    this.guideLine.parent?.remove(this.guideLine);
+    this.guideLine.geometry.dispose();
+    (this.guideLine.material as THREE.Material).dispose();
+    this.guideLine = null;
   }
 
   private commit(ctx: ToolContext) {
@@ -821,9 +897,11 @@ export class DrawPolygonTool implements Tool {
     this.pointsUv = [];
     this.currentUv = null;
     this.firstClickPixels = null;
+    this.shiftHeld = false;
     this.numeric.clear();
     this.preview.clear(ctx.scene);
     this.snapIndicator.hide();
+    this.removeGuideLine();
     measurementHud.hide();
   }
 }

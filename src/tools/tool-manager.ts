@@ -16,6 +16,10 @@ export class ToolManager {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       this.activeTool?.onKeyDown?.(e, this.ctx);
     });
+    window.addEventListener("keyup", (e) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      this.activeTool?.onKeyUp?.(e, this.ctx);
+    });
   }
 
   setTool(tool: Tool) {

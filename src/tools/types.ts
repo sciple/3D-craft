@@ -19,6 +19,7 @@ export interface Tool {
   onPointerMove?(e: PointerEvent, ctx: ToolContext): void;
   onPointerUp?(e: PointerEvent, ctx: ToolContext): void;
   onKeyDown?(e: KeyboardEvent, ctx: ToolContext): void;
+  onKeyUp?(e: KeyboardEvent, ctx: ToolContext): void;
 }
 
 export function pointerToNdc(e: PointerEvent, domElement: HTMLElement): THREE.Vector2 {
