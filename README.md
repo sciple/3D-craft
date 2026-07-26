@@ -75,8 +75,14 @@ Other controls:
     (thin-walled hulls, tanks) are treated as solid and so read heavy. Material and scale choices
     persist between sessions (stored locally, not in the project file).
 - **File menu**: save/open a project, export STL (blocked if the model isn't a watertight,
-  printable solid), and **Arrange for Print** (moves every printable solid onto a floor-aligned,
-  non-overlapping grid, ready to slice; flat sketches are left alone).
+  printable solid), **Arrange for Print** (moves every printable solid onto a floor-aligned,
+  non-overlapping grid, ready to slice; flat sketches are left alone), and **Check Model**.
+  - **Check Model**: reports whether every printable solid is watertight, and if not, draws the
+    offending edges in **red** directly in the viewport — the rim of the hole where a face is
+    missing, so you can see which part is broken instead of guessing. The red edges draw on top of
+    the model, so a problem on the far side is still visible without orbiting. If an STL export is
+    refused, the same information is one click away via **Show Me** in the error dialog. The
+    highlight clears itself as soon as you make any edit (including Undo).
 - **Closing the window**: if there are unsaved changes, closing prompts to **Save**, **Discard**,
   or **Cancel** instead of silently quitting.
 

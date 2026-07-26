@@ -35,6 +35,30 @@ export interface DocumentSnapshot {
   selected_face_ids: FaceId[];
 }
 
+/// One offending edge from `checkModel`, in world coordinates rather than as
+/// indices into `DocumentSnapshot.vertices` - see the Rust `ProblemEdge` for
+/// why (snapshot vertex interning is per-call and order-dependent).
+export interface ProblemEdge {
+  a: [number, number, number];
+  b: [number, number, number];
+}
+
+/// Result of the watertightness check STL export gates on - see
+/// `Document::check_model` on the Rust side.
+export interface ModelReport {
+  /// Connected printable solids found in the document.
+  part_count: number;
+  /// How many of those have at least one issue.
+  broken_part_count: number;
+  open_edges: ProblemEdge[];
+  duplicate_edges: ProblemEdge[];
+  problem_face_ids: FaceId[];
+}
+
+export function reportHasProblems(report: ModelReport): boolean {
+  return report.open_edges.length > 0 || report.duplicate_edges.length > 0;
+}
+
 export function faceIdKey(id: FaceId): string {
   return `${id.idx}:${id.version}`;
 }
@@ -42,6 +66,7 @@ export function faceIdKey(id: FaceId): string {
 type Vec3 = [number, number, number];
 type Vec2 = [number, number];
 type Listener = (snapshot: DocumentSnapshot) => void;
+type ReportListener = (report: ModelReport | null) => void;
 
 const EMPTY_SNAPSHOT: DocumentSnapshot = { vertices: [], faces: [], groups: [], selected_face_ids: [] };
 
@@ -55,6 +80,13 @@ class DocumentStore {
   // this true - see `applyEdit` vs. the plain `apply` used by
   // selectFaces/selectGroup/refresh.
   private dirty = false;
+  // The watertightness problems currently being shown in the viewport (see
+  // `showModelProblems`), or null when nothing is highlighted. Kept apart
+  // from `snapshot` because it isn't produced by the mutating commands -
+  // it's an on-demand diagnostic the user asks for, and it must survive the
+  // selection-only snapshots that arrive while they click around the model.
+  private report: ModelReport | null = null;
+  private reportListeners = new Set<ReportListener>();
   // Every command is chained through this so they execute (and apply their
   // resulting snapshot) in strict call order, never overlapping. Without
   // this, two commands fired in quick succession (e.g. a draw click
@@ -94,7 +126,36 @@ class DocumentStore {
   /// selection-only commands.
   private applyEdit(snapshot: DocumentSnapshot) {
     this.dirty = true;
+    // Any geometry change can fix or move the problems that were
+    // highlighted, so drop the overlay rather than leave stale red edges
+    // floating where the geometry no longer is. Plain `apply` deliberately
+    // doesn't, so the highlight survives selecting/orbiting.
+    this.showModelProblems(null);
     this.apply(snapshot);
+  }
+
+  subscribeModelReport(listener: ReportListener): () => void {
+    this.reportListeners.add(listener);
+    return () => this.reportListeners.delete(listener);
+  }
+
+  getModelReport(): ModelReport | null {
+    return this.report;
+  }
+
+  /// Shows (or, with null, clears) the problem-edge highlight in the
+  /// viewport. Separate from `checkModel` so running the check doesn't
+  /// force a highlight the user didn't ask for.
+  showModelProblems(report: ModelReport | null) {
+    if (this.report === null && report === null) return;
+    this.report = report;
+    for (const listener of this.reportListeners) listener(report);
+  }
+
+  /// Runs the watertightness diagnostic STL export gates on. Read-only: it
+  /// neither mutates the document nor touches the undo history.
+  checkModel(): Promise<ModelReport> {
+    return this.enqueue(() => invoke<ModelReport>("check_model"));
   }
 
   refresh() {
@@ -311,6 +372,10 @@ class DocumentStore {
     return this.enqueue(async () => {
       this.apply(await invoke<DocumentSnapshot>("load_project", { path }));
       this.dirty = false;
+      // Uses `apply`, not `applyEdit`, so clear the highlight explicitly -
+      // the incoming document has nothing to do with whatever was flagged
+      // in the one being replaced.
+      this.showModelProblems(null);
     });
   }
 

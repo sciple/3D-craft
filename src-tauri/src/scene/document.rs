@@ -540,6 +540,45 @@ impl Document {
         self.mesh.faces.keys().filter(|id| self.solid_face_ids.contains(id)).collect()
     }
 
+    /// Runs the watertightness check STL export gates on, but keeps the
+    /// detail: which edges are open and which faces border them, so the
+    /// frontend can highlight the broken spot instead of leaving the user to
+    /// hunt for it. Scoped exactly like `export_stl` and `arrange_for_print`
+    /// (printable solids only - a flat sketch has no thickness and can't be
+    /// "open"), and run per connected component so a document with several
+    /// parts can report how many of them are actually broken.
+    pub fn check_model(&self) -> ModelReport {
+        let solid_ids = self.solid_boundary_face_ids();
+        let components = self.mesh.connected_components(&solid_ids);
+
+        let mut report = ModelReport {
+            part_count: components.len(),
+            broken_part_count: 0,
+            open_edges: Vec::new(),
+            duplicate_edges: Vec::new(),
+            problem_face_ids: Vec::new(),
+        };
+        let to_edge = |(a, b): (VertexId, VertexId)| {
+            let (pa, pb) = (self.mesh.position(a), self.mesh.position(b));
+            ProblemEdge {
+                a: [pa.x as f32, pa.y as f32, pa.z as f32],
+                b: [pb.x as f32, pb.y as f32, pb.z as f32],
+            }
+        };
+
+        for component in components {
+            let issues = pushpull::check_manifold(&self.mesh, &component);
+            if issues.is_empty() {
+                continue;
+            }
+            report.broken_part_count += 1;
+            report.open_edges.extend(issues.open_edges.into_iter().map(to_edge));
+            report.duplicate_edges.extend(issues.duplicate_edges.into_iter().map(to_edge));
+            report.problem_face_ids.extend(issues.problem_faces);
+        }
+        report
+    }
+
     /// Moves every disconnected solid onto a non-overlapping grid in the XY
     /// plane, floor-aligned (each solid's lowest point lands at z=0) - a
     /// one-click "prepare for print" step. Each connected component of
@@ -802,6 +841,37 @@ pub struct DocumentSnapshot {
     pub faces: Vec<FaceSnapshot>,
     pub groups: Vec<GroupSnapshot>,
     pub selected_face_ids: Vec<FaceId>,
+}
+
+/// One offending edge, in world coordinates rather than as indices into
+/// `DocumentSnapshot::vertices`: that interning is per-call and depends on
+/// face iteration order (see `Document::snapshot`), so index-based edges
+/// could silently desync from whatever snapshot the frontend is currently
+/// holding. Positions can't.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProblemEdge {
+    pub a: [f32; 3],
+    pub b: [f32; 3],
+}
+
+/// The result of `Document::check_model` - what STL export needs to be
+/// watertight, phrased so the frontend can both explain the problem and draw
+/// it in the viewport.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelReport {
+    /// Connected printable solids found (see `Mesh::connected_components`).
+    pub part_count: usize,
+    /// How many of those have at least one issue.
+    pub broken_part_count: usize,
+    pub open_edges: Vec<ProblemEdge>,
+    pub duplicate_edges: Vec<ProblemEdge>,
+    pub problem_face_ids: Vec<FaceId>,
+}
+
+impl ModelReport {
+    pub fn is_watertight(&self) -> bool {
+        self.open_edges.is_empty() && self.duplicate_edges.is_empty()
+    }
 }
 
 #[cfg(test)]

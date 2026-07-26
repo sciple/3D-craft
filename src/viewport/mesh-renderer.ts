@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import type { DocumentSnapshot, FaceId } from "../state/document-store";
+import type { DocumentSnapshot, FaceId, ModelReport } from "../state/document-store";
 import { faceIdKey } from "../state/document-store";
 
 /// Renders the document's triangulated geometry as one mesh, plus a second
@@ -12,6 +12,7 @@ export class MeshRenderer {
   readonly mesh: THREE.Mesh;
   readonly highlightMesh: THREE.Mesh;
   readonly edges: THREE.LineSegments;
+  readonly problemEdges: THREE.LineSegments;
   private triangleFaceIds: FaceId[] = [];
 
   constructor(scene: THREE.Scene) {
@@ -57,6 +58,40 @@ export class MeshRenderer {
     this.edges = new THREE.LineSegments(new THREE.BufferGeometry(), edgeMaterial);
     this.edges.renderOrder = 2;
     scene.add(this.edges);
+
+    // Watertightness problems (see `showProblems`). `depthTest: false` is
+    // the point of this overlay: an open edge on the far side of a solid
+    // has to be findable without orbiting to hunt for it, so these draw on
+    // top of everything. It also has to carry the "this is the broken bit"
+    // signal through color alone - LineBasicMaterial's `linewidth` is
+    // ignored by ANGLE (the WebGL backend on Windows), so the lines can't
+    // be made thicker.
+    const problemMaterial = new THREE.LineBasicMaterial({ color: 0xff2020, depthTest: false });
+    this.problemEdges = new THREE.LineSegments(new THREE.BufferGeometry(), problemMaterial);
+    this.problemEdges.renderOrder = 4;
+    this.problemEdges.visible = false;
+    scene.add(this.problemEdges);
+  }
+
+  /// Draws a model-check report's offending edges in red, or clears the
+  /// overlay when given null. Unlike the other three objects this one owns
+  /// its own position buffer (the report carries world coordinates, not
+  /// indices into `snapshot.vertices`), which is what lets it survive the
+  /// selection-only snapshots `update` handles in between.
+  showProblems(report: ModelReport | null) {
+    const edges = report ? [...report.open_edges, ...report.duplicate_edges] : [];
+    if (edges.length === 0) {
+      this.problemEdges.visible = false;
+      return;
+    }
+    const positions = new Float32Array(edges.length * 6);
+    edges.forEach((edge, i) => {
+      positions.set(edge.a, i * 6);
+      positions.set(edge.b, i * 6 + 3);
+    });
+    this.problemEdges.geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    this.problemEdges.geometry.computeBoundingSphere();
+    this.problemEdges.visible = true;
   }
 
   update(snapshot: DocumentSnapshot) {

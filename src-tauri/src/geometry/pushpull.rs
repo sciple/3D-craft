@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::mesh::{FaceId, Mesh, VertexId};
 use super::triangulate::triangulate_face;
@@ -99,12 +99,47 @@ fn push_pull_impl(mesh: &mut Mesh, face_id: FaceId, distance: f64, attached: boo
     new_face_ids
 }
 
+/// The specific edges that make a face set fail the watertightness check,
+/// retained so the UI can point at the broken spot instead of only saying
+/// "something is open somewhere". See `check_manifold`.
+#[derive(Debug, Default, Clone)]
+pub struct ManifoldIssues {
+    /// Triangulated edges with no opposite-direction twin: an open border -
+    /// a missing or erased face, or two faces meeting at a T-junction.
+    pub open_edges: Vec<(VertexId, VertexId)>,
+    /// Edges appearing more than once in the same direction: duplicated or
+    /// inconsistently wound geometry. Reported once per undirected edge.
+    pub duplicate_edges: Vec<(VertexId, VertexId)>,
+    /// Every face that contributed one of the above, deduplicated.
+    pub problem_faces: Vec<FaceId>,
+}
+
+impl ManifoldIssues {
+    pub fn is_empty(&self) -> bool {
+        self.open_edges.is_empty() && self.duplicate_edges.is_empty()
+    }
+}
+
 /// Checks that `face_ids` form a closed, consistently-wound (watertight) 2D
 /// manifold: every triangulated edge must appear exactly once in each
 /// direction (i.e. shared by exactly two triangles with opposite winding).
 /// A mesh that fails this check will fail to slice for 3D printing.
+///
+/// Note this does *not* catch 2D self-overlap within a single face's own
+/// triangulation, only 3D edge pairing.
 pub fn is_manifold(mesh: &Mesh, face_ids: &[FaceId]) -> bool {
-    let mut directed_edge_counts: HashMap<(VertexId, VertexId), u32> = HashMap::new();
+    check_manifold(mesh, face_ids).is_empty()
+}
+
+/// The detail-returning form of `is_manifold`: same edge-pairing pass, but
+/// it keeps the offending edges (and the faces they came from) instead of
+/// collapsing everything to a bool, so a failed STL export can show the user
+/// *where* the model is open.
+pub fn check_manifold(mesh: &Mesh, face_ids: &[FaceId]) -> ManifoldIssues {
+    // Value is (how many times this exact direction occurs, which faces
+    // contributed it) - the face attribution is the only thing added over a
+    // plain count.
+    let mut directed_edges: HashMap<(VertexId, VertexId), (u32, Vec<FaceId>)> = HashMap::new();
     for &face_id in face_ids {
         let Some(face) = mesh.faces.get(face_id) else {
             continue;
@@ -113,13 +148,37 @@ pub fn is_manifold(mesh: &Mesh, face_ids: &[FaceId]) -> bool {
             for k in 0..3 {
                 let a = tri[k];
                 let b = tri[(k + 1) % 3];
-                *directed_edge_counts.entry((a, b)).or_insert(0) += 1;
+                let entry = directed_edges.entry((a, b)).or_insert((0, Vec::new()));
+                entry.0 += 1;
+                if !entry.1.contains(&face_id) {
+                    entry.1.push(face_id);
+                }
             }
         }
     }
-    directed_edge_counts.iter().all(|(&(a, b), &count)| {
-        count == 1 && directed_edge_counts.get(&(b, a)).copied().unwrap_or(0) == 1
-    })
+
+    let mut issues = ManifoldIssues::default();
+    let mut problem_faces: HashSet<FaceId> = HashSet::new();
+    let mut seen_duplicates: HashSet<(VertexId, VertexId)> = HashSet::new();
+    for (&(a, b), (count, faces)) in directed_edges.iter() {
+        let twin_count = directed_edges.get(&(b, a)).map(|(c, _)| *c).unwrap_or(0);
+        if *count > 1 {
+            // Both directions of a duplicated edge land here, so key the
+            // report on the undirected edge to avoid listing it twice.
+            let key = if a < b { (a, b) } else { (b, a) };
+            if seen_duplicates.insert(key) {
+                issues.duplicate_edges.push((a, b));
+            }
+        } else if twin_count == 0 {
+            // Only one direction exists by definition - no dedup needed.
+            issues.open_edges.push((a, b));
+        } else {
+            continue;
+        }
+        problem_faces.extend(faces.iter().copied());
+    }
+    issues.problem_faces = problem_faces.into_iter().collect();
+    issues
 }
 
 #[cfg(test)]
@@ -169,5 +228,83 @@ mod tests {
         // 2 caps + 16 outer-wall quads + 16 inner-wall quads.
         assert_eq!(new_faces.len(), 2 + 16 + 16);
         assert!(is_manifold(&mesh, &new_faces));
+    }
+
+    /// Builds a unit box and returns (mesh, its 6 face ids).
+    fn unit_box() -> (Mesh, Vec<FaceId>) {
+        let mut mesh = Mesh::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let face_id = add_rectangle(&mut mesh, &plane, DVec2::new(0.0, 0.0), DVec2::new(1.0, 1.0));
+        let faces = push_pull(&mut mesh, face_id, 1.0);
+        (mesh, faces)
+    }
+
+    #[test]
+    fn check_manifold_reports_nothing_for_a_closed_solid() {
+        let (mesh, faces) = unit_box();
+        let issues = check_manifold(&mesh, &faces);
+        assert!(issues.is_empty());
+        assert!(issues.open_edges.is_empty());
+        assert!(issues.duplicate_edges.is_empty());
+        assert!(issues.problem_faces.is_empty());
+    }
+
+    #[test]
+    fn erasing_a_face_reports_the_hole_rim_and_the_faces_around_it() {
+        let (mut mesh, faces) = unit_box();
+        // Erase one wall, the "I deleted part of my solid" case that makes
+        // STL export refuse.
+        let erased = faces[0];
+        let erased_edge_count = mesh.faces[erased].outer.len();
+        mesh.remove_face(erased);
+        let remaining: Vec<FaceId> = faces.into_iter().filter(|&f| f != erased).collect();
+
+        let issues = check_manifold(&mesh, &remaining);
+        assert!(!issues.is_empty());
+        assert!(issues.duplicate_edges.is_empty(), "a plain hole isn't duplicated geometry");
+        // The rim of the hole: one open edge per boundary edge of the face
+        // that used to close it.
+        assert_eq!(issues.open_edges.len(), erased_edge_count);
+        // Every reported face is one that's still in the mesh (the erased
+        // one can't be pointed at - it's gone), and the rim of a box's wall
+        // touches the four faces around it.
+        assert_eq!(issues.problem_faces.len(), 4);
+        for &fid in &issues.problem_faces {
+            assert!(mesh.faces.contains_key(fid));
+        }
+    }
+
+    #[test]
+    fn a_doubled_face_is_reported_as_duplicate_not_open() {
+        let (mut mesh, mut faces) = unit_box();
+        // Same loop, same winding, added twice: every one of its edges now
+        // occurs twice in the same direction.
+        let doubled = mesh.faces[faces[0]].clone();
+        faces.push(mesh.add_face(doubled.outer, doubled.holes));
+
+        let issues = check_manifold(&mesh, &faces);
+        assert!(!issues.is_empty());
+        assert!(issues.open_edges.is_empty());
+        // Every boundary edge of the doubled face is reported, once per
+        // undirected edge rather than once per direction (which is why the
+        // lookup below has to accept either orientation).
+        let outer = mesh.faces[faces[0]].outer.clone();
+        for i in 0..outer.len() {
+            let (a, b) = (outer[i], outer[(i + 1) % outer.len()]);
+            assert!(
+                issues.duplicate_edges.contains(&(a, b)) || issues.duplicate_edges.contains(&(b, a)),
+                "boundary edge {i} of the doubled face should be reported as duplicated"
+            );
+        }
+    }
+
+    #[test]
+    fn is_manifold_still_agrees_with_check_manifold() {
+        let (mut mesh, faces) = unit_box();
+        assert!(is_manifold(&mesh, &faces));
+        let erased = faces[0];
+        mesh.remove_face(erased);
+        let remaining: Vec<FaceId> = faces.into_iter().filter(|&f| f != erased).collect();
+        assert!(!is_manifold(&mesh, &remaining));
     }
 }

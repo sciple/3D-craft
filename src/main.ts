@@ -71,6 +71,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   installCloseGuard();
 
   documentStore.subscribe((snapshot) => meshRenderer.update(snapshot));
+  documentStore.subscribeModelReport((report) => meshRenderer.showProblems(report));
   await documentStore.refresh();
 
   // Ctrl+Z / Ctrl+Y (and the common Ctrl+Shift+Z alternative) drive

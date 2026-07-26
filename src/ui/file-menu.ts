@@ -1,5 +1,6 @@
-import { save, open } from "@tauri-apps/plugin-dialog";
-import { documentStore } from "../state/document-store";
+import { save, open, ask, message } from "@tauri-apps/plugin-dialog";
+import { documentStore, reportHasProblems } from "../state/document-store";
+import type { ModelReport } from "../state/document-store";
 import { icons } from "./icons";
 
 /// Save/Open/Export STL - each backed by the OS's native file picker (the
@@ -30,7 +31,12 @@ export function createFileMenu(container: HTMLElement) {
   arrangeButton.innerHTML = icons.arrangeForPrint;
   arrangeButton.addEventListener("click", () => void handleArrangeForPrint());
 
-  bar.append(saveButton, openButton, exportButton, arrangeButton);
+  const checkButton = document.createElement("button");
+  checkButton.title = "Check Model";
+  checkButton.innerHTML = icons.checkModel;
+  checkButton.addEventListener("click", () => void handleCheckModel());
+
+  bar.append(saveButton, openButton, exportButton, arrangeButton, checkButton);
   container.appendChild(bar);
 }
 
@@ -77,8 +83,56 @@ async function handleExportStl() {
   try {
     await documentStore.exportStl(path);
   } catch (err) {
-    alert(`Couldn't export STL: ${err}`);
+    // A refused export used to be a dead end: the user was told the model
+    // isn't watertight but not *where*. Re-run the same check in its
+    // detail-returning form and offer to draw the offending edges in the
+    // viewport. Errors with nothing to point at (empty document, sketches
+    // only) still just report themselves.
+    const report = await documentStore.checkModel();
+    if (!reportHasProblems(report)) {
+      alert(`Couldn't export STL: ${err}`);
+      return;
+    }
+    const show = await ask(`${err}\n\n${problemSummary(report)}`, {
+      title: "Export STL",
+      kind: "warning",
+      okLabel: "Show Me",
+      cancelLabel: "Close",
+    });
+    if (show) documentStore.showModelProblems(report);
   }
+}
+
+/// The Check Model button: the same diagnostic as above, available at any
+/// time instead of only when an export attempt has already been refused.
+/// Highlights straight away when there's something to show - the user asked
+/// for the check, so a second "show me?" prompt would just be in the way.
+async function handleCheckModel() {
+  const report = await documentStore.checkModel();
+  if (!reportHasProblems(report)) {
+    documentStore.showModelProblems(null);
+    await message(
+      report.part_count === 0
+        ? "Nothing printable yet - use Push/Pull to turn a sketch into a solid."
+        : `Model is watertight: ${report.part_count} part(s) ready to export.`,
+      { title: "Check Model", kind: "info" },
+    );
+    return;
+  }
+  documentStore.showModelProblems(report);
+  await message(`${problemSummary(report)}\n\nThe problem edges are highlighted in red.`, {
+    title: "Check Model",
+    kind: "warning",
+  });
+}
+
+function problemSummary(report: ModelReport): string {
+  const counts: string[] = [];
+  if (report.open_edges.length > 0) counts.push(`${report.open_edges.length} open edge(s)`);
+  if (report.duplicate_edges.length > 0) {
+    counts.push(`${report.duplicate_edges.length} duplicated edge(s)`);
+  }
+  return `${report.broken_part_count} of ${report.part_count} part(s) affected: ${counts.join(", ")}.`;
 }
 
 async function handleArrangeForPrint() {

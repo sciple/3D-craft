@@ -37,6 +37,7 @@ pub fn run() {
             commands::load_project,
             commands::export_stl,
             commands::arrange_for_print,
+            commands::check_model,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

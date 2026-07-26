@@ -29,4 +29,8 @@ export const icons = {
   arrangeForPrint: svg(
     `<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>`,
   ),
+  // A solid with a tick - "is this printable?"
+  checkModel: svg(
+    `<path d="M12 2.5l8 4.5v9l-8 4.5-8-4.5v-9z"/><path d="M8 11.5l3 3 5.5-5.5"/>`,
+  ),
 };

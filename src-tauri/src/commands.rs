@@ -8,7 +8,7 @@ use crate::geometry::plane::Plane;
 use crate::geometry::pushpull;
 use crate::io::project_file::ProjectFile;
 use crate::io::stl_export;
-use crate::scene::document::{Document, DocumentSnapshot, GroupId, MirrorAxis};
+use crate::scene::document::{Document, DocumentSnapshot, GroupId, MirrorAxis, ModelReport};
 
 /// How many undo steps to retain. Documents at this app's scale (a
 /// spaceship part, not a large assembly) are small enough that cloning the
@@ -352,6 +352,16 @@ pub fn export_stl(state: State<AppState>, path: String) -> Result<(), String> {
     }
     let bytes = stl_export::write_binary_stl(&document.mesh, &solid_ids);
     std::fs::write(&path, bytes).map_err(|e| e.to_string())
+}
+
+/// Read-only watertightness diagnostic: the same check `export_stl` gates
+/// on, but returning *where* the model is open so the frontend can highlight
+/// it (see `Document::check_model`). Deliberately does not call
+/// `history.record()` - same reasoning as the selection commands: it changes
+/// nothing, so Ctrl+Z must not step over it.
+#[tauri::command]
+pub fn check_model(state: State<AppState>) -> ModelReport {
+    state.0.lock().unwrap().document.check_model()
 }
 
 #[cfg(test)]
