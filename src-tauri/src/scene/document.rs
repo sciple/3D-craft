@@ -178,20 +178,28 @@ impl Document {
             .map(|(id, _)| id)
             .collect();
 
-        let mut loops: Vec<Vec<VertexId>> = coplanar_face_ids
-            .iter()
-            .flat_map(|&fid| {
-                let face = &self.mesh.faces[fid];
-                std::iter::once(face.outer.clone()).chain(face.holes.iter().cloned())
-            })
-            .collect();
+        let outers: Vec<Vec<VertexId>> =
+            coplanar_face_ids.iter().map(|&fid| self.mesh.faces[fid].outer.clone()).collect();
+        let holes: Vec<Vec<VertexId>> =
+            coplanar_face_ids.iter().flat_map(|&fid| self.mesh.faces[fid].holes.clone()).collect();
+
+        let mut loops: Vec<Vec<VertexId>> = outers.iter().cloned().chain(holes.iter().cloned()).collect();
         loops.push(new_loop);
+
+        // A hole here may legitimately be filled by another face in this same
+        // coplanar set (a disc sitting in a ring's middle) - that face is
+        // being erased too, so its disc has to come back from the re-detect.
+        // A hole that matches no erased face's outer, though, is genuinely
+        // empty (the user erased what filled it, or a solid's wall closes it
+        // in 3D) and must stay empty.
+        let protected_holes: Vec<Vec<VertexId>> =
+            holes.into_iter().filter(|h| !matches_any_loop(h, &outers)).collect();
 
         for fid in &coplanar_face_ids {
             self.erase_face(*fid);
         }
 
-        self.resplit_loops(plane, loops)
+        self.resplit_loops(plane, loops, &protected_holes)
     }
 
     /// Inline-offsets `face_id`'s outer boundary inward by `offset` (in
@@ -235,6 +243,16 @@ impl Document {
         let origin = self.mesh.position(face.outer[0]);
         let plane = Plane::from_normal(origin, face.normal);
 
+        // A hole in this face is there because something else already closes
+        // it - most often a push/pulled stud or recess whose wall meets this
+        // face at exactly that rim. Re-detecting over this face's loops would
+        // otherwise hand back a fresh disc filling that rim, duplicating every
+        // edge the wall already pairs with and breaking watertightness. Since
+        // only this one face is being rebuilt, anything that did fill the hole
+        // is a different face and is left untouched, so dropping the refill is
+        // always right here (unlike in `resplit_plane`, which erases and
+        // rebuilds a whole set of coplanar faces at once).
+        let protected_holes = face.holes.clone();
         let mut loops = vec![face.outer.clone()];
         loops.extend(face.holes.iter().cloned());
         loops.extend(extra_loops);
@@ -243,7 +261,7 @@ impl Document {
         let was_solid = self.solid_face_ids.contains(&face_id);
         self.erase_face(face_id);
 
-        let new_faces = self.resplit_loops(&plane, loops);
+        let new_faces = self.resplit_loops(&plane, loops, &protected_holes);
         if let Some(group_id) = was_grouped {
             if let Some(group) = self.groups.get_mut(group_id) {
                 group.face_ids.extend(&new_faces);
@@ -263,7 +281,18 @@ impl Document {
     /// faces/holes over it, and creates the resulting faces. Shared by
     /// `resplit_plane` (sticky-geometry auto-split while drawing) and
     /// `inset_face` (splitting one face into an inner face + offset frame).
-    fn resplit_loops(&mut self, plane: &Plane, loops: Vec<Vec<VertexId>>) -> Vec<FaceId> {
+    ///
+    /// `protected_holes` are loops that must stay empty: `face_detect`
+    /// reports every enclosed region it finds, including the inside of a
+    /// hole the source face already had, so without this it would
+    /// re-materialize a face there. See `resplit_face_with_loops` for why
+    /// that's wrong.
+    fn resplit_loops(
+        &mut self,
+        plane: &Plane,
+        loops: Vec<Vec<VertexId>>,
+        protected_holes: &[Vec<VertexId>],
+    ) -> Vec<FaceId> {
         let mut index_of: HashMap<VertexId, usize> = HashMap::new();
         let mut points: Vec<DVec2> = Vec::new();
         let mut vertex_by_index: Vec<VertexId> = Vec::new();
@@ -290,14 +319,17 @@ impl Document {
 
         detected
             .into_iter()
-            .map(|df| {
+            .filter_map(|df| {
                 let outer: Vec<VertexId> = df.outer.iter().map(|&i| vertex_by_index[i]).collect();
+                if matches_any_loop(&outer, protected_holes) {
+                    return None;
+                }
                 let holes: Vec<Vec<VertexId>> = df
                     .holes
                     .iter()
                     .map(|h| h.iter().map(|&i| vertex_by_index[i]).collect())
                     .collect();
-                self.mesh.add_face(outer, holes)
+                Some(self.mesh.add_face(outer, holes))
             })
             .collect()
     }
@@ -798,6 +830,21 @@ fn clone_loop_through_map(
     cloned
 }
 
+/// Whether `subject` is the same ring of mesh vertices as any of
+/// `candidates`. Compared as vertex sets: `face_detect` traces its cycles
+/// from the same vertices the original loops were built from, but is free to
+/// start anywhere in the ring and (for the opposite winding) to run the other
+/// way round, so neither order nor starting point can be relied on.
+fn matches_any_loop(subject: &[VertexId], candidates: &[Vec<VertexId>]) -> bool {
+    if candidates.is_empty() {
+        return false;
+    }
+    let subject_set: HashSet<VertexId> = subject.iter().copied().collect();
+    candidates
+        .iter()
+        .any(|c| c.len() == subject.len() && c.iter().all(|v| subject_set.contains(v)))
+}
+
 /// A face is coplanar with `plane` when it faces the same way (not the
 /// opposite side of the same plane) and every one of its outer-loop vertices
 /// lies on it within tolerance.
@@ -1249,6 +1296,92 @@ mod tests {
         assert!(pushpull::is_manifold(&doc.mesh, &all_faces), "extended box must stay watertight");
         let top_z = doc.mesh.vertices.values().map(|v| v.position.z).fold(f64::MIN, f64::max);
         assert!((top_z - 2.0).abs() < 1e-9);
+    }
+
+    /// The slab's top cap: the z=2 upward face still carrying the original
+    /// rectangle's 4-vertex outer loop. Looked up fresh on every use because
+    /// each resplit erases and recreates it.
+    fn slab_top_cap(doc: &Document) -> FaceId {
+        doc.mesh
+            .faces
+            .iter()
+            .find(|(_, f)| f.normal.z > 0.9 && f.outer.len() == 4 && (doc.mesh.position(f.outer[0]).z - 2.0).abs() < 1e-9)
+            .map(|(id, _)| id)
+            .expect("slab top cap")
+    }
+
+    #[test]
+    fn a_second_stud_drawn_on_a_solid_keeps_the_first_stud_watertight() {
+        // Two circles sketched on the same face of a solid and extruded into
+        // studs. The second sketch resplits a face that already carries the
+        // FIRST stud's rim as a hole - that hole must stay a hole, because
+        // the first stud's wall already closes it in 3D. Refilling it with a
+        // disc duplicates every edge around that rim.
+        let mut doc = Document::new();
+        let ground = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let sketch_id = doc.draw_rectangle(&ground, DVec2::ZERO, DVec2::new(30.0, 10.0), None)[0];
+        doc.push_pull(sketch_id, 2.0);
+        // Same 2D frame as `ground`, just lifted to the slab's top face, so
+        // circle centers below read in the rectangle's own coordinates.
+        let top_plane = Plane::from_normal(DVec3::new(0.0, 0.0, 2.0), DVec3::Z);
+
+        let split = doc.draw_circle(&top_plane, DVec2::new(7.0, 5.0), 3.0, 16, Some(slab_top_cap(&doc)));
+        let disc = split.iter().copied().find(|&fid| doc.mesh.faces[fid].holes.is_empty()).unwrap();
+        doc.push_pull(disc, 3.0);
+        assert!(
+            pushpull::is_manifold(&doc.mesh, &doc.solid_boundary_face_ids()),
+            "one stud on a slab must be watertight"
+        );
+
+        // The second circle, drawn on that same now-holed top cap.
+        doc.draw_circle(&top_plane, DVec2::new(23.0, 5.0), 3.0, 16, Some(slab_top_cap(&doc)));
+        assert!(
+            pushpull::is_manifold(&doc.mesh, &doc.solid_boundary_face_ids()),
+            "sketching a second circle must not refill the first stud's rim"
+        );
+
+        let second_disc = doc
+            .mesh
+            .faces
+            .iter()
+            .find(|(_, f)| {
+                f.normal.z > 0.9 && f.holes.is_empty() && (doc.mesh.position(f.outer[0]).z - 2.0).abs() < 1e-9
+            })
+            .map(|(id, _)| id)
+            .expect("the new circle's disc");
+        doc.push_pull(second_disc, 3.0);
+        assert!(
+            pushpull::is_manifold(&doc.mesh, &doc.solid_boundary_face_ids()),
+            "two studs on one slab must be watertight"
+        );
+    }
+
+    #[test]
+    fn drawing_elsewhere_on_the_ground_does_not_refill_an_erased_hole() {
+        // Same root cause as the two-stud test, on the flat-sketch path:
+        // ring on the ground (circle drawn inside a rectangle, inner disc
+        // erased), then an unrelated rectangle drawn coplanar. The
+        // document-wide resplit re-detects over every coplanar loop - the
+        // ring's hole among them - and must not hand the erased disc back.
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), None);
+        let split = doc.draw_circle(&plane, DVec2::new(5.0, 5.0), 2.0, 16, None);
+        let disc = split.iter().copied().find(|&fid| doc.mesh.faces[fid].holes.is_empty()).unwrap();
+        doc.erase_face(disc);
+        assert_eq!(doc.mesh.faces.len(), 1, "a ring: one face with one hole");
+        assert_eq!(doc.mesh.faces.values().next().unwrap().holes.len(), 1);
+
+        doc.draw_rectangle(&plane, DVec2::new(20.0, 20.0), DVec2::new(25.0, 25.0), None);
+
+        let ring = doc
+            .mesh
+            .faces
+            .values()
+            .find(|f| f.outer.iter().any(|&v| doc.mesh.position(v).x < 15.0))
+            .expect("the ring");
+        assert_eq!(ring.holes.len(), 1, "the ring must still have its hole");
+        assert_eq!(doc.mesh.faces.len(), 2, "just the ring and the new rectangle - no refilled disc");
     }
 
     #[test]
