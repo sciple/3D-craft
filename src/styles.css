@@ -117,7 +117,7 @@ body {
   position: fixed;
   top: 12px;
   right: 12px;
-  width: 200px;
+  width: 260px;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -185,6 +185,7 @@ body {
 
 .outliner-actions-row {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   border-top: 1px solid #3a3f47;
   padding-top: 8px;
@@ -234,7 +235,7 @@ body {
 .parts-catalog {
   position: fixed;
   top: 12px;
-  right: 248px;
+  right: 308px;
   width: 220px;
   display: flex;
   flex-direction: column;

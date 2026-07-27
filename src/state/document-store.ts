@@ -310,6 +310,15 @@ class DocumentStore {
     });
   }
 
+  /// Moves each disconnected object within `faceIds` independently down (or
+  /// up) along Z so every one of them rests on the build plate (Z = 0). See
+  /// `Document::drop_to_plate`.
+  dropToPlate(faceIds: FaceId[]) {
+    return this.enqueue(async () => {
+      this.applyEdit(await invoke<DocumentSnapshot>("drop_to_plate", { faceIds }));
+    });
+  }
+
   rotateFaces(faceIds: FaceId[], pivot: Vec3, axis: Vec3, angleRadians: number) {
     return this.enqueue(async () => {
       this.applyEdit(await invoke<DocumentSnapshot>("rotate_faces", { faceIds, pivot, axis, angleRadians }));

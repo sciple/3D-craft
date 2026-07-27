@@ -25,6 +25,7 @@ pub fn run() {
             commands::inset_face,
             commands::erase_face,
             commands::move_faces,
+            commands::drop_to_plate,
             commands::rotate_faces,
             commands::scale_faces,
             commands::duplicate_faces,

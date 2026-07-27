@@ -672,6 +672,18 @@ impl Document {
         }
     }
 
+    /// Moves every disconnected object within `face_ids` independently down
+    /// (or up) along Z so each one's own lowest point rests on the build
+    /// plate (Z = 0). Mirrors `arrange_for_print`'s per-component floor
+    /// alignment, scoped to the given selection instead of the whole
+    /// document, and only touches Z (no X/Y repositioning).
+    pub fn drop_to_plate(&mut self, face_ids: &[FaceId]) {
+        for component in self.mesh.connected_components(face_ids) {
+            let (min, _) = self.mesh.bounding_box(&component);
+            self.translate_faces(&component, DVec3::new(0.0, 0.0, -min.z));
+        }
+    }
+
     /// Builds the full render/selection payload sent to the frontend after
     /// every mutating command. Documents at this app's scale (a spaceship
     /// part, not a large assembly) are small enough that resending
@@ -1776,5 +1788,73 @@ mod tests {
 
         let positions_after: Vec<DVec3> = doc.mesh.vertices.values().map(|v| v.position).collect();
         assert_eq!(positions_before, positions_after, "a flat, un-extruded sketch must be left untouched");
+    }
+
+    #[test]
+    fn drop_to_plate_floors_a_single_object_above_the_plate() {
+        let mut doc = Document::new();
+        let faces = make_box(&mut doc, DVec2::new(0.0, 0.0), 2.0, 5.0, 2.0); // z in [5, 7]
+
+        doc.drop_to_plate(&faces);
+
+        let (min, _) = doc.mesh.bounding_box(&faces);
+        assert!(min.z.abs() < 1e-9, "part must be floor-aligned, got min.z = {}", min.z);
+    }
+
+    #[test]
+    fn drop_to_plate_floors_a_single_object_below_the_plate() {
+        let mut doc = Document::new();
+        let faces = make_box(&mut doc, DVec2::new(0.0, 0.0), 2.0, 0.0, -3.0); // z in [-3, 0]
+
+        doc.drop_to_plate(&faces);
+
+        let (min, _) = doc.mesh.bounding_box(&faces);
+        assert!(min.z.abs() < 1e-9, "part must be floor-aligned, got min.z = {}", min.z);
+    }
+
+    #[test]
+    fn drop_to_plate_moves_each_disconnected_selected_object_independently() {
+        let mut doc = Document::new();
+        // Two separate boxes at different heights and different XY origins,
+        // both selected together - each must land at its own min-Z = 0
+        // without picking up the other's delta (no rigid-group move) and
+        // without its X/Y position changing.
+        let box_a = make_box(&mut doc, DVec2::new(0.0, 0.0), 2.0, 5.0, 2.0); // z in [5, 7]
+        let box_b = make_box(&mut doc, DVec2::new(10.0, 10.0), 2.0, -4.0, 1.0); // z in [-4, -3]
+
+        let (a_min_before, _) = doc.mesh.bounding_box(&box_a);
+        let (b_min_before, _) = doc.mesh.bounding_box(&box_b);
+
+        let mut selection = box_a.clone();
+        selection.extend(box_b.clone());
+        doc.drop_to_plate(&selection);
+
+        let (a_min_after, _) = doc.mesh.bounding_box(&box_a);
+        let (b_min_after, _) = doc.mesh.bounding_box(&box_b);
+        assert!(a_min_after.z.abs() < 1e-9, "box a must be floor-aligned, got min.z = {}", a_min_after.z);
+        assert!(b_min_after.z.abs() < 1e-9, "box b must be floor-aligned, got min.z = {}", b_min_after.z);
+        assert!((a_min_after.x - a_min_before.x).abs() < 1e-9, "box a's X must be untouched");
+        assert!((a_min_after.y - a_min_before.y).abs() < 1e-9, "box a's Y must be untouched");
+        assert!((b_min_after.x - b_min_before.x).abs() < 1e-9, "box b's X must be untouched");
+        assert!((b_min_after.y - b_min_before.y).abs() < 1e-9, "box b's Y must be untouched");
+    }
+
+    #[test]
+    fn drop_to_plate_moves_a_partial_face_subset_via_shared_vertices() {
+        let mut doc = Document::new();
+        let faces = make_box(&mut doc, DVec2::new(0.0, 0.0), 2.0, 5.0, 2.0); // z in [5, 7]
+
+        // Only pass a subset of the solid's faces - `translate_faces`
+        // resolves through shared vertices, so the whole solid should still
+        // move together as long as the passed faces reference every vertex
+        // that needs to move (here, just dropping the whole face set works
+        // the same as the full solid since connected_components merges them
+        // by shared vertex into one component regardless of subset size).
+        let subset = &faces[..faces.len() - 1];
+
+        doc.drop_to_plate(subset);
+
+        let (min, _) = doc.mesh.bounding_box(&faces);
+        assert!(min.z.abs() < 1e-9, "solid must be floor-aligned via shared vertices, got min.z = {}", min.z);
     }
 }

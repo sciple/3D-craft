@@ -206,6 +206,14 @@ pub fn move_faces(state: State<AppState>, face_ids: Vec<FaceId>, delta: DVec3) -
 }
 
 #[tauri::command]
+pub fn drop_to_plate(state: State<AppState>, face_ids: Vec<FaceId>) -> DocumentSnapshot {
+    let mut history = state.0.lock().unwrap();
+    history.record();
+    history.document.drop_to_plate(&face_ids);
+    history.document.snapshot()
+}
+
+#[tauri::command]
 pub fn rotate_faces(
     state: State<AppState>,
     face_ids: Vec<FaceId>,

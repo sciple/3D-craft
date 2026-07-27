@@ -61,7 +61,9 @@ Other controls:
 - **Build plate**: the ground grid is a true-scale 180 × 180 mm print bed in 10 mm cells, centered
   on the origin; the brighter outline marks the printable boundary.
 - **Undo / Redo**: `Ctrl+Z` / `Ctrl+Y` (or `Ctrl+Shift+Z`).
-- **Outliner** (right panel): manage groups and mirror a copy of the selection across X/Y/Z.
+- **Outliner** (right panel): manage groups, mirror a copy of the selection across X/Y/Z, and
+  **Drop to Plate** — moves every selected object independently down (or up) along Z so each one
+  rests on the build plate.
 - **Parts Catalog** (collapsible dropdown, top right): a guided build manifest of spacecraft subsystems (propulsion,
   reactors, crew cabins, solar sails, …) with 3D-print tips. A part's dot turns **green** once
   it's modeled — i.e. once a group of that name exists. Click a green part's **Select** to

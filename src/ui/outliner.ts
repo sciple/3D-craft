@@ -50,7 +50,21 @@ export function createOutliner(container: HTMLElement) {
     });
     return button;
   });
-  actionsRow.append(...mirrorButtons);
+
+  // Drops each disconnected selected object independently onto the build
+  // plate (Z = 0) - each object's own lowest point rests on the plate,
+  // relative offsets between separately-selected objects are not preserved.
+  // See `Document::drop_to_plate`.
+  const dropToPlateButton = document.createElement("button");
+  dropToPlateButton.textContent = "Drop to Plate";
+  dropToPlateButton.title = "Move each selected object down so it rests on the build plate (Z = 0)";
+  dropToPlateButton.addEventListener("click", () => {
+    const selected = documentStore.getSnapshot().selected_face_ids;
+    if (selected.length === 0) return;
+    void documentStore.dropToPlate(selected);
+  });
+
+  actionsRow.append(...mirrorButtons, dropToPlateButton);
 
   panel.append(createRow, actionsRow, list);
   container.appendChild(panel);
@@ -58,6 +72,7 @@ export function createOutliner(container: HTMLElement) {
   documentStore.subscribe((snapshot) => {
     const hasSelection = snapshot.selected_face_ids.length > 0;
     for (const button of mirrorButtons) button.disabled = !hasSelection;
+    dropToPlateButton.disabled = !hasSelection;
 
     list.replaceChildren();
     for (const group of snapshot.groups) {
