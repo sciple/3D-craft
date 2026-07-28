@@ -50,7 +50,7 @@ to set an exact value (mm, or degrees for Rotate) and press **Enter** to commit;
 
 | Tool | Key | What it does |
 | --- | --- | --- |
-| Select | `S` | Click a face to select. `Ctrl+D` duplicates the selection. |
+| Select | `S` | Click a face to select; double/triple-click grabs the whole connected object. Drag over empty space to box-select - touching any face of an object with the rectangle selects that object's whole connected set of faces. `Shift` adds to the selection. `Ctrl+D` duplicates the selection. |
 | Rectangle | `R` | Draw a rectangle on the ground or on an existing face. |
 | Circle | `C` | Draw a circle. |
 | Arc | `A` | Click center, click to set radius, click (or type degrees) to set the sweep. Closes with a straight chord - a 180° arc is a half-pipe cross-section. |
