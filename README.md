@@ -1,8 +1,16 @@
-# 3D-craft
+
+
+![App logo](docs/media/app-logo.png)
+
+# 3D-craft (AKA D-Craft)
 
 A lightweight native Windows CAD tool for modeling small parts to 3D print, inspired by
 SketchUp's workflow. Built with Rust + Tauri v2 + three.js. Sketch a face, push/pull it into a
 solid, refine, and export a print-ready STL (millimeters, Z-up).
+
+
+![App screenshot](docs/media/app-screenshot.png)
+
 
 ## Install
 
@@ -95,3 +103,12 @@ Other controls:
 - `cd src-tauri && cargo test` — run the Rust test suite
 
 See [CLAUDE.md](CLAUDE.md) for architecture and contributor notes.
+
+## License
+
+GPLv3 — see [LICENSE](LICENSE). Anyone is free to use, modify, and redistribute this app;
+modified versions that are distributed must also be released under GPLv3.
+
+Inspired by SketchUp's modeling workflow (push/pull, orbit-style camera), but is an independent,
+from-scratch implementation — no SketchUp code, assets, or branding — and isn't affiliated with or
+endorsed by Trimble Inc.

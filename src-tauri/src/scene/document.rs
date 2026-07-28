@@ -775,29 +775,60 @@ impl Document {
 
     /// Rebuilds a document from a loaded project file, re-interning every
     /// vertex/face/group into fresh mesh/slotmap ids.
+    ///
+    /// Every index in the file is untrusted input - the file may have been
+    /// hand-edited, truncated, or written by a different version - so a
+    /// reference that doesn't resolve drops the thing referencing it rather
+    /// than indexing blindly. This has to be total: a panic here would
+    /// happen inside `commands::load_project` while the `AppState` mutex is
+    /// held, poisoning it and making every subsequent command panic on its
+    /// own `lock().unwrap()` - i.e. one bad file would brick the running app,
+    /// not just fail the load.
     pub fn from_project_file(project: &ProjectFile) -> Self {
         let mut doc = Document::new();
 
-        let vertex_ids: Vec<VertexId> =
-            project.vertices.iter().map(|p| doc.mesh.add_vertex(DVec3::new(p[0], p[1], p[2]))).collect();
+        // Index-stable: `None` marks a vertex that can't be used, so later
+        // indices still line up with the file's own numbering.
+        let vertex_ids: Vec<Option<VertexId>> = project
+            .vertices
+            .iter()
+            .map(|p| {
+                let pos = DVec3::new(p[0], p[1], p[2]);
+                // NaN/infinity would silently poison every normal, bounding
+                // box, and exported triangle downstream.
+                pos.is_finite().then(|| doc.mesh.add_vertex(pos))
+            })
+            .collect();
+        let resolve = |loop_indices: &[u32]| -> Option<Vec<VertexId>> {
+            loop_indices.iter().map(|&i| vertex_ids.get(i as usize).copied().flatten()).collect()
+        };
 
-        let face_ids: Vec<FaceId> = project
+        let face_ids: Vec<Option<FaceId>> = project
             .faces
             .iter()
             .map(|pf| {
-                let outer: Vec<VertexId> = pf.outer.iter().map(|&i| vertex_ids[i as usize]).collect();
+                // A loop of under 3 vertices encloses no area and has no
+                // meaningful normal, so it can't be a face.
+                let outer = resolve(&pf.outer).filter(|o| o.len() >= 3)?;
                 let holes: Vec<Vec<VertexId>> =
-                    pf.holes.iter().map(|h| h.iter().map(|&i| vertex_ids[i as usize]).collect()).collect();
+                    pf.holes.iter().filter_map(|h| resolve(h).filter(|r| r.len() >= 3)).collect();
                 let face_id = doc.mesh.add_face(outer, holes);
                 if pf.solid {
                     doc.solid_face_ids.insert(face_id);
                 }
-                face_id
+                Some(face_id)
             })
             .collect();
 
         for group in &project.groups {
-            let member_ids: Vec<FaceId> = group.face_indices.iter().map(|&i| face_ids[i as usize]).collect();
+            let member_ids: Vec<FaceId> = group
+                .face_indices
+                .iter()
+                .filter_map(|&i| face_ids.get(i as usize).copied().flatten())
+                .collect();
+            if member_ids.is_empty() {
+                continue;
+            }
             doc.group_faces(&member_ids, group.name.clone());
         }
 
@@ -1695,6 +1726,52 @@ mod tests {
         let face_count_before = reloaded.mesh.faces.len();
         reloaded.draw_rectangle(&plane, DVec2::new(10.0, 10.0), DVec2::new(11.0, 11.0), None);
         assert_eq!(reloaded.mesh.faces.len(), face_count_before + 1, "reloaded solid's faces must be untouched");
+    }
+
+    #[test]
+    fn loading_a_project_file_with_out_of_range_indices_is_not_a_panic() {
+        // A hand-edited, truncated, or hostile .json must not panic: a panic
+        // inside a `#[tauri::command]` happens while the AppState mutex is
+        // held, which poisons it and bricks every later command (they all
+        // `lock().unwrap()`). Out-of-range references are dropped instead.
+        let project = ProjectFile {
+            vertices: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]],
+            faces: vec![
+                ProjectFace { outer: vec![0, 1, 2], holes: vec![], solid: false },
+                ProjectFace { outer: vec![0, 1, 999], holes: vec![], solid: false },
+                ProjectFace { outer: vec![0, 1, 2], holes: vec![vec![7]], solid: false },
+            ],
+            groups: vec![ProjectGroup { name: "g".to_string(), face_indices: vec![0, 42] }],
+        };
+
+        let doc = Document::from_project_file(&project);
+
+        // The face with the dangling *outer* index is dropped entirely; the
+        // one whose only problem is a dangling hole keeps its valid outer
+        // loop and loses just the hole.
+        assert_eq!(doc.mesh.faces.len(), 2);
+        assert!(doc.mesh.faces.values().all(|f| f.holes.is_empty()), "the unresolvable hole loop should be dropped");
+        assert_eq!(doc.groups.len(), 1);
+        assert_eq!(doc.groups.values().next().unwrap().face_ids.len(), 1, "the dangling face index should be dropped");
+    }
+
+    #[test]
+    fn loading_a_project_file_with_degenerate_faces_drops_them() {
+        // A loop with fewer than 3 vertices has no meaningful normal and
+        // would flow into triangulation as a zero-area face.
+        let project = ProjectFile {
+            vertices: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]],
+            faces: vec![
+                ProjectFace { outer: vec![0, 1], holes: vec![], solid: false },
+                ProjectFace { outer: vec![], holes: vec![], solid: false },
+                ProjectFace { outer: vec![0, 1, 2], holes: vec![], solid: false },
+            ],
+            groups: vec![],
+        };
+
+        let doc = Document::from_project_file(&project);
+
+        assert_eq!(doc.mesh.faces.len(), 1, "the 2-vertex and empty loops must be dropped");
     }
 
     #[test]
