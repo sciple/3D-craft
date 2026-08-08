@@ -213,6 +213,64 @@ body {
   cursor: default;
 }
 
+/* Array Copy: two compact label+number lines. Kept out of
+   .outliner-actions-row because that row's `flex: 1` buttons would squeeze
+   the existing Mirror/Drop to Plate buttons. */
+.outliner-array-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-top: 1px solid #3a3f47;
+  padding-top: 8px;
+  margin-top: 2px;
+}
+
+.outliner-array-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8em;
+  color: #b3b8bf;
+}
+
+.outliner-array-line label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.outliner-array-line input {
+  width: 44px;
+  min-width: 0;
+  border: 1px solid #4a5058;
+  border-radius: 6px;
+  padding: 4px 6px;
+  font-size: 1em;
+  background-color: #23262b;
+  color: #f0f0f0;
+}
+
+.outliner-array-line button {
+  margin-left: auto;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 1em;
+  font-weight: 500;
+  color: #f0f0f0;
+  background-color: #3a3f47;
+  cursor: pointer;
+}
+
+.outliner-array-line button:hover:not(:disabled) {
+  background-color: #4a5058;
+}
+
+.outliner-array-line button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 /* Axis letters colored to match the viewport axes (red=X, green=Y, blue=Z). */
 .axis-label {
   font-weight: 700;

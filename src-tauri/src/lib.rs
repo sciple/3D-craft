@@ -28,6 +28,7 @@ pub fn run() {
             commands::rotate_faces,
             commands::scale_faces,
             commands::duplicate_faces,
+            commands::array_faces,
             commands::mirror_faces,
             commands::group_faces,
             commands::ungroup,

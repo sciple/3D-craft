@@ -346,6 +346,19 @@ class DocumentStore {
     });
   }
 
+  /// Copies `faceIds` into a `columns` x `rows` grid stepping `pitchX` along
+  /// world X and `pitchY` along world Y, in a single undo step - see
+  /// `Document::array_faces`. The counts include the source, so 1 x 1 is a
+  /// no-op. Rejects (like `exportStl`) on non-positive or absurd counts, so
+  /// callers must catch and surface the message.
+  arrayFaces(faceIds: FaceId[], columns: number, rows: number, pitchX: number, pitchY: number) {
+    return this.enqueue(async () => {
+      this.applyEdit(
+        await invoke<DocumentSnapshot>("array_faces", { faceIds, columns, rows, pitchX, pitchY }),
+      );
+    });
+  }
+
   groupFaces(faceIds: FaceId[], name: string) {
     return this.enqueue(async () => {
       this.applyEdit(await invoke<DocumentSnapshot>("group_faces", { faceIds, name }));

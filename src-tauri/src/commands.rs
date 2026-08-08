@@ -15,6 +15,12 @@ use crate::scene::document::{Document, DocumentSnapshot, GroupId, MirrorAxis, Mo
 /// whole `Document` per step is cheap, so a generous cap costs little.
 const MAX_UNDO_STEPS: usize = 100;
 
+/// Upper bound on the cells an Array Copy may produce. A mistyped count
+/// (300 x 200 instead of 3 x 2) would otherwise build tens of thousands of
+/// solids and hang the app with no way back; this turns that into an error
+/// message. Well above any plausible print-plate layout.
+const MAX_ARRAY_CELLS: usize = 400;
+
 /// Owns the live document plus linear undo/redo history. Every *modeling*
 /// command snapshots the document before mutating it; pure selection
 /// commands intentionally don't, so Ctrl+Z undoes geometry edits rather than
@@ -243,6 +249,37 @@ pub fn duplicate_faces(state: State<AppState>, face_ids: Vec<FaceId>, delta: DVe
     history.document.snapshot()
 }
 
+/// Copies the selection into a `columns` x `rows` grid in one undo step -
+/// the whole point of doing this in the backend rather than looping
+/// `duplicate_faces` from the frontend, which would leave one undo entry per
+/// copy. See `Document::array_faces` for the grid layout and why the counts
+/// include the source. Guards run *before* `record()` so a rejected call
+/// doesn't leave a no-op undo step behind.
+#[tauri::command]
+pub fn array_faces(
+    state: State<AppState>,
+    face_ids: Vec<FaceId>,
+    columns: usize,
+    rows: usize,
+    pitch_x: f64,
+    pitch_y: f64,
+) -> Result<DocumentSnapshot, String> {
+    if columns < 1 || rows < 1 {
+        return Err("An array needs at least 1 column and 1 row.".to_string());
+    }
+    let cells = columns.checked_mul(rows).unwrap_or(usize::MAX);
+    if cells > MAX_ARRAY_CELLS {
+        return Err(format!(
+            "{columns} x {rows} is {cells} copies - too many to build (limit {MAX_ARRAY_CELLS}). \
+             Use smaller counts."
+        ));
+    }
+    let mut history = state.0.lock().unwrap();
+    history.record();
+    history.document.array_faces(&face_ids, columns, rows, pitch_x, pitch_y);
+    Ok(history.document.snapshot())
+}
+
 #[tauri::command]
 pub fn mirror_faces(
     state: State<AppState>,
@@ -417,6 +454,27 @@ mod tests {
         history.document.draw_circle(&plane, DVec2::new(5.0, 5.0), 1.0, 8, None);
         assert!(history.redo_stack.is_empty());
         assert_eq!(history.document.mesh.faces.len(), 1);
+    }
+
+    /// The whole reason `array_faces` is a backend command instead of a
+    /// frontend loop over `duplicate_faces`: the entire grid must collapse
+    /// into a single undo step.
+    #[test]
+    fn an_array_of_copies_undoes_in_one_step() {
+        let mut history = History::default();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        history.record();
+        let sketch_id = history.document.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0), None)[0];
+        history.record();
+        let box_faces = history.document.push_pull(sketch_id, 1.0);
+        let faces_before = history.document.mesh.faces.len();
+
+        history.record();
+        history.document.array_faces(&box_faces, 3, 2, 30.0, 30.0);
+        assert_eq!(history.document.mesh.faces.len(), faces_before + 5 * 6);
+
+        history.undo();
+        assert_eq!(history.document.mesh.faces.len(), faces_before, "one undo must remove every copy in the grid, not just the last one");
     }
 
     #[test]

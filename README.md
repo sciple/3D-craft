@@ -72,6 +72,13 @@ Other controls:
 - **Outliner** (right panel): manage groups, mirror a copy of the selection across X/Y/Z, and
   **Drop to Plate** — moves every selected object independently down (or up) along Z so each one
   rests on the build plate.
+  - **Array** — copies the selection into a grid: set **Cols** (across X) and **Rows** (along Y),
+    plus the **Pitch** X/Y spacing in mm, then click **Array**. The counts *include* the original,
+    so `3 × 2` gives six objects in total, and the pitch is **center-to-center** (a pitch smaller
+    than the part will overlap the copies — set it larger than the part's size plus the gap you
+    want). Selecting any face of an object arrays the whole object. The whole grid is created in
+    one step, so a single `Ctrl+Z` undoes it, and is left selected ready for a Move or
+    **Group Selected**.
 - **Parts Catalog** (collapsible dropdown, top right): a guided build manifest of spacecraft subsystems (propulsion,
   reactors, crew cabins, solar sails, …) with 3D-print tips. A part's dot turns **green** once
   it's modeled — i.e. once a group of that name exists. Click a green part's **Select** to

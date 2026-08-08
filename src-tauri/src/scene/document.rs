@@ -431,6 +431,52 @@ impl Document {
         new_faces
     }
 
+    /// Copies `face_ids` into a `columns` x `rows` grid, stepping `pitch_x`
+    /// along world X per column and `pitch_y` along world Y per row. The
+    /// pitch is center-to-center, so a pitch smaller than the part
+    /// deliberately overlaps rather than being clamped - the user asked for
+    /// that spacing. The counts include the source, which stays put in cell
+    /// (0, 0), so only the other `columns * rows - 1` cells get copies;
+    /// that's how CAD array counts read (3 x 2 means six objects total).
+    /// Passes `reverse_winding: false` to `clone_faces_mapped`: a pure
+    /// translation preserves handedness, so reversing would flip every
+    /// copy's normals inward.
+    ///
+    /// Unlike `duplicate_faces`/`mirror_faces`, which leave just the *copy*
+    /// selected, this leaves the *whole grid* (source included) selected -
+    /// the grid, not any one copy, is the thing the user just made, and it's
+    /// ready for a follow-up Move or Group Selected.
+    pub fn array_faces(
+        &mut self,
+        face_ids: &[FaceId],
+        columns: usize,
+        rows: usize,
+        pitch_x: f64,
+        pitch_y: f64,
+    ) -> Vec<FaceId> {
+        let mut new_faces = Vec::new();
+        for row in 0..rows {
+            for col in 0..columns {
+                if row == 0 && col == 0 {
+                    continue; // the source already occupies this cell
+                }
+                let delta = DVec3::new(col as f64 * pitch_x, row as f64 * pitch_y, 0.0);
+                new_faces.extend(self.clone_faces_mapped(face_ids, |p| p + delta, false));
+            }
+        }
+        if !new_faces.is_empty() {
+            // Stale source ids are silently dropped rather than selected, the
+            // same way `clone_faces_mapped` skips them.
+            self.selection.faces = face_ids
+                .iter()
+                .copied()
+                .filter(|&fid| self.mesh.faces.contains_key(fid))
+                .chain(new_faces.iter().copied())
+                .collect();
+        }
+        new_faces
+    }
+
     /// Mirrors a *copy* of `face_ids` across the world plane perpendicular
     /// to `axis` through `pivot` (e.g. `MirrorAxis::X` mirrors across the
     /// plane x = pivot.x) - the source geometry is left untouched, matching
@@ -1549,6 +1595,68 @@ mod tests {
             let x = doc.mesh.position(vid).x;
             assert!((0.0..=1.0).contains(&x), "duplicating must not move the source geometry, x={x}");
         }
+    }
+
+    #[test]
+    fn array_of_a_box_produces_a_grid_of_independent_manifold_copies() {
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0), None)[0];
+        let box_faces = doc.push_pull(sketch_id, 1.0);
+
+        let copies = doc.array_faces(&box_faces, 3, 2, 30.0, 30.0);
+
+        assert_eq!(copies.len(), 5 * 6, "3 x 2 counts the source, so 5 cells get a 6-faced copy");
+        assert_eq!(doc.mesh.vertices.len(), 8 * 6, "each copy clones its own 8 distinct vertices, shared across its 6 faces");
+        assert_eq!(doc.solid_boundary_face_ids().len(), 6 * 6, "every copy must inherit solid-boundary status");
+
+        let solids = doc.solid_boundary_face_ids();
+        let components = doc.mesh.connected_components(&solids);
+        assert_eq!(components.len(), 6, "the grid must be 6 separate objects, not one fused blob");
+        for component in &components {
+            assert!(pushpull::is_manifold(&doc.mesh, component), "each box in the array must be manifold on its own");
+        }
+
+        for &vid in &doc.mesh.faces[box_faces[0]].outer {
+            let x = doc.mesh.position(vid).x;
+            assert!((0.0..=1.0).contains(&x), "arraying must not move the source geometry, x={x}");
+        }
+
+        let expected: HashSet<FaceId> = box_faces.iter().chain(copies.iter()).copied().collect();
+        assert_eq!(doc.selection.faces, expected, "the whole grid, source included, should become the new selection");
+    }
+
+    #[test]
+    fn array_pitch_is_center_to_center() {
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(20.0, 20.0), None)[0];
+        let box_faces = doc.push_pull(sketch_id, 5.0);
+
+        doc.array_faces(&box_faces, 3, 2, 30.0, 40.0);
+
+        let all: Vec<FaceId> = doc.mesh.faces.keys().collect();
+        let (min, max) = doc.mesh.bounding_box(&all);
+        assert!((min.x - 0.0).abs() < 1e-9 && (min.y - 0.0).abs() < 1e-9, "the grid should start at the source, min={min}");
+        // Last column's near edge sits at 2 * pitch, plus the part's own 20mm.
+        assert!((max.x - (2.0 * 30.0 + 20.0)).abs() < 1e-9, "3 columns at pitch 30 should span 80mm, got {}", max.x);
+        assert!((max.y - (1.0 * 40.0 + 20.0)).abs() < 1e-9, "2 rows at pitch 40 should span 60mm, got {}", max.y);
+    }
+
+    #[test]
+    fn array_of_one_by_one_creates_nothing() {
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(1.0, 1.0), None)[0];
+        let box_faces = doc.push_pull(sketch_id, 1.0);
+        let before = doc.mesh.faces.len();
+        doc.select(&box_faces);
+
+        let copies = doc.array_faces(&box_faces, 1, 1, 30.0, 30.0);
+
+        assert!(copies.is_empty(), "a 1 x 1 array is just the source - nothing to copy");
+        assert_eq!(doc.mesh.faces.len(), before, "a no-op array must not touch the mesh");
+        assert_eq!(doc.selection.faces, box_faces.iter().copied().collect::<HashSet<FaceId>>(), "a no-op array must leave the selection alone");
     }
 
     #[test]
