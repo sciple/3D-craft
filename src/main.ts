@@ -1,6 +1,7 @@
 import { initViewport } from "./viewport/scene";
 import { CadCameraControls } from "./viewport/controls";
 import { MeshRenderer } from "./viewport/mesh-renderer";
+import { GuideRenderer } from "./viewport/guide-renderer";
 import { documentStore } from "./state/document-store";
 import { ToolManager } from "./tools/tool-manager";
 import type { ToolContext } from "./tools/types";
@@ -27,6 +28,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   const { scene, camera, renderer } = initViewport(viewportEl);
   new CadCameraControls(camera, renderer.domElement);
   const meshRenderer = new MeshRenderer(scene);
+  const guideRenderer = new GuideRenderer(scene);
 
   const ctx: ToolContext = {
     scene,
@@ -70,7 +72,10 @@ window.addEventListener("DOMContentLoaded", async () => {
   createFileMenu(uiRootEl);
   installCloseGuard();
 
-  documentStore.subscribe((snapshot) => meshRenderer.update(snapshot));
+  documentStore.subscribe((snapshot) => {
+    meshRenderer.update(snapshot);
+    guideRenderer.update(snapshot);
+  });
   documentStore.subscribeModelReport((report) => meshRenderer.showProblems(report));
   await documentStore.refresh();
 

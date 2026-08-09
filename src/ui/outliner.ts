@@ -66,7 +66,14 @@ export function createOutliner(container: HTMLElement) {
     void documentStore.dropToPlate(selected);
   });
 
-  actionsRow.append(...mirrorButtons, dropToPlateButton);
+  // Removes every Measure-tool guide in one undo step. Not selection-gated
+  // like its neighbours - guides aren't geometry and aren't selectable;
+  // enabled purely by whether any exist. See `Document::clear_guides`.
+  const clearGuidesButton = document.createElement("button");
+  clearGuidesButton.title = "Remove every mark left by the Measure tool (one undo step)";
+  clearGuidesButton.addEventListener("click", () => void documentStore.clearGuides());
+
+  actionsRow.append(...mirrorButtons, dropToPlateButton, clearGuidesButton);
 
   // Array Copy: lays the selection out as a columns x rows grid on the build
   // plate in one undoable step. See `Document::array_faces` for why the
@@ -149,6 +156,10 @@ export function createOutliner(container: HTMLElement) {
     for (const button of mirrorButtons) button.disabled = !hasSelection;
     dropToPlateButton.disabled = !hasSelection;
     arrayButton.disabled = !hasSelection;
+
+    const guideCount = snapshot.guides.length;
+    clearGuidesButton.textContent = guideCount > 0 ? `Clear Guides (${guideCount})` : "Clear Guides";
+    clearGuidesButton.disabled = guideCount === 0;
 
     list.replaceChildren();
     for (const group of snapshot.groups) {

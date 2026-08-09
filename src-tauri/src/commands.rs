@@ -323,6 +323,38 @@ pub fn select_faces(state: State<AppState>, face_ids: Vec<FaceId>) -> DocumentSn
     history.document.snapshot()
 }
 
+/// Records the segment the Measure tool just measured as a persistent guide.
+/// One measurement = one guide = one undo step, so Ctrl+Z after a stray
+/// measurement removes exactly that mark. Guards run *before* `record()`
+/// (same reasoning as `array_faces`): a degenerate or non-finite segment
+/// must not leave a no-op undo step behind, and a NaN would poison the
+/// renderer's bounding sphere.
+#[tauri::command]
+pub fn add_guide(state: State<AppState>, a: DVec3, b: DVec3) -> DocumentSnapshot {
+    let mut history = state.0.lock().unwrap();
+    if !a.is_finite() || !b.is_finite() || a.distance_squared(b) < 1e-12 {
+        return history.document.snapshot();
+    }
+    history.record();
+    history.document.add_guide(a, b);
+    history.document.snapshot()
+}
+
+/// Removes every guide in one undo step. No-op-safe: with no guides there is
+/// nothing to record, and recording anyway would make Ctrl+Z silently step
+/// over the user's *previous, real* edit - same reasoning as the selection
+/// commands not recording.
+#[tauri::command]
+pub fn clear_guides(state: State<AppState>) -> DocumentSnapshot {
+    let mut history = state.0.lock().unwrap();
+    if history.document.guides.is_empty() {
+        return history.document.snapshot();
+    }
+    history.record();
+    history.document.clear_guides();
+    history.document.snapshot()
+}
+
 /// Writes the current document to `path` as a JSON project file. The path
 /// itself is chosen frontend-side via the dialog plugin's native save
 /// picker - this command just needs a resolved path, no plugin required on
@@ -475,6 +507,81 @@ mod tests {
 
         history.undo();
         assert_eq!(history.document.mesh.faces.len(), faces_before, "one undo must remove every copy in the grid, not just the last one");
+    }
+
+    #[test]
+    fn undoing_a_corner_stud_sketch_restores_the_neighboring_walls_split_edge() {
+        // `Document::propagate_boundary_split_to_solid_siblings` is the only
+        // operation here that edits an *already existing, otherwise
+        // untouched* face's loop in place, rather than creating new faces or
+        // replacing a face's own loop wholesale. `record()` snapshots the
+        // whole document, so undo covers it - but nothing else in the
+        // codebase relies on that for a mutation of this shape, so pin it.
+        let mut history = History::default();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        history.record();
+        let sketch_id = history.document.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), None)[0];
+        history.record();
+        let box_faces = history.document.push_pull(sketch_id, 4.0);
+
+        let loop_sizes = |doc: &crate::scene::document::Document| -> Vec<usize> {
+            let mut sizes: Vec<usize> = doc.mesh.faces.values().map(|f| f.outer.len()).collect();
+            sizes.sort_unstable();
+            sizes
+        };
+        let before = loop_sizes(&history.document);
+
+        let top_id = box_faces.iter().copied().find(|&fid| history.document.mesh.faces[fid].normal.z > 0.9).unwrap();
+        let top = history.document.mesh.faces[top_id].clone();
+        let top_plane = Plane::from_normal(history.document.mesh.position(top.outer[0]), top.normal);
+        let corner = top_plane.to_2d(history.document.mesh.position(top.outer[0]));
+
+        history.record();
+        history.document.draw_rectangle(&top_plane, corner, corner + DVec2::new(5.0, 5.0), Some(top_id));
+        let after = loop_sizes(&history.document);
+        assert_ne!(after, before, "the sketch must have split the cap and grown two neighboring walls");
+        assert_eq!(
+            after.iter().filter(|&&n| n == 5).count(),
+            2,
+            "both walls sharing the split edge gain exactly one T-junction vertex"
+        );
+
+        history.undo();
+        assert_eq!(
+            loop_sizes(&history.document),
+            before,
+            "undo must restore the in-place edits made to the neighboring walls, not just the new faces"
+        );
+    }
+
+    #[test]
+    fn clearing_guides_undoes_in_one_step() {
+        let mut history = History::default();
+        for i in 0..3 {
+            history.record();
+            history.document.add_guide(DVec3::new(i as f64, 0.0, 0.0), DVec3::new(i as f64, 1.0, 0.0));
+        }
+        assert_eq!(history.document.guides.len(), 3);
+
+        history.record();
+        history.document.clear_guides();
+        assert!(history.document.guides.is_empty());
+
+        history.undo();
+        assert_eq!(history.document.guides.len(), 3, "one undo must restore every cleared guide, not just the last one");
+    }
+
+    #[test]
+    fn undo_after_a_measurement_removes_just_that_guide() {
+        let mut history = History::default();
+        history.record();
+        history.document.add_guide(DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 0.0, 0.0));
+        history.record();
+        history.document.add_guide(DVec3::new(0.0, 0.0, 0.0), DVec3::new(0.0, 1.0, 0.0));
+        assert_eq!(history.document.guides.len(), 2);
+
+        history.undo();
+        assert_eq!(history.document.guides.len(), 1, "undo after a measurement should remove only that guide");
     }
 
     #[test]

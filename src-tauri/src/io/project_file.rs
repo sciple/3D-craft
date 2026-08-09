@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::scene::document::Guide;
+
 /// The on-disk project format: a flat, serde-friendly mirror of a
 /// `Document`'s geometry - deliberately not a direct serialization of
 /// `Document` itself, since its vertex/face ids are slotmap keys that are
@@ -12,6 +14,13 @@ pub struct ProjectFile {
     pub vertices: Vec<[f64; 3]>,
     pub faces: Vec<ProjectFace>,
     pub groups: Vec<ProjectGroup>,
+    /// Guides didn't exist in earlier versions of this format - there's no
+    /// schema version field here, so `#[serde(default)]` is what lets a
+    /// project file saved before this field existed keep loading instead of
+    /// failing with "missing field 'guides'". Any future field added here
+    /// needs the same treatment.
+    #[serde(default)]
+    pub guides: Vec<Guide>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
