@@ -44,6 +44,23 @@ impl Mesh {
         self.vertices.insert(Vertex { position })
     }
 
+    /// Distance (mm) within which two positions are treated as "the same
+    /// point" when welding a freshly-drawn vertex onto existing geometry it
+    /// was snapped to. Far above the rounding error a coordinate picks up
+    /// round-tripping through the f32 `DocumentSnapshot` (endpoint/edge/
+    /// guide snapping only ever sends the frontend raw coordinates, never a
+    /// `VertexId`, so a corner snapped onto existing geometry is *always* a
+    /// brand new vertex at a position a hair off the original's true f64
+    /// value) and far below any feature this app's 3D-printing use case
+    /// would draw. Deliberately *not* a mesh-wide "reuse the nearest vertex
+    /// on add" helper: two independently-drawn, unrelated objects can
+    /// legitimately share a corner coordinate (e.g. two parts both starting
+    /// at the origin), and welding those together would merge objects the
+    /// user never asked to connect. See `Document::weld_loop_onto` for the
+    /// scoped version actually used - only against the specific set of
+    /// vertices an operation is meant to connect to.
+    pub const WELD_TOLERANCE: f64 = 1e-3;
+
     pub fn position(&self, id: VertexId) -> DVec3 {
         self.vertices[id].position
     }

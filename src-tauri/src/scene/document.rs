@@ -32,6 +32,24 @@ pub struct Group {
     pub face_ids: Vec<FaceId>,
 }
 
+/// A construction guide left behind by the Measure tool: the measured
+/// segment itself. Its two endpoints, its midpoint, and any point along it
+/// are snap targets, so a primitive can be built exactly on a distance you
+/// just measured. Guides are reference-only annotations - they never enter
+/// `Mesh`, so they're automatically invisible to triangulation, STL export,
+/// `check_model`, bounding boxes and `connected_components`.
+///
+/// Deliberately world-fixed: no transform command (translate/rotate/scale,
+/// drop-to-plate, arrange-for-print) moves them. There's no non-arbitrary
+/// rule for "which guides belong to this face set", and the primary workflow
+/// - measure on part A, move A aside, build part B on the marks - depends on
+/// guides staying put.
+#[derive(Debug, Clone, Copy, Serialize, serde::Deserialize)]
+pub struct Guide {
+    pub a: DVec3,
+    pub b: DVec3,
+}
+
 /// The whole editable document: one flat geometry pool plus the groups and
 /// selection layered on top of it. Faces created by unrelated draw/push-pull
 /// operations never share vertices, so translating/rotating/scaling a set of
@@ -42,6 +60,7 @@ pub struct Document {
     pub mesh: Mesh,
     pub groups: SlotMap<GroupId, Group>,
     pub selection: Selection,
+    pub guides: Vec<Guide>,
     face_to_group: HashMap<FaceId, GroupId>,
     /// Faces created by push_pull (caps and side walls of an already-built
     /// solid). Excluded from resplit_plane's coplanar search: a solid's cap
@@ -58,6 +77,7 @@ impl Document {
             mesh: Mesh::new(),
             groups: SlotMap::with_key(),
             selection: Selection::default(),
+            guides: Vec::new(),
             face_to_group: HashMap::new(),
             solid_face_ids: HashSet::new(),
         }
@@ -195,11 +215,20 @@ impl Document {
         let protected_holes: Vec<Vec<VertexId>> =
             holes.into_iter().filter(|h| !matches_any_loop(h, &outers)).collect();
 
+        // Detect the replacement geometry before erasing anything - see
+        // `resplit_face_with_loops` for why: erasing first and finding
+        // `resplit_loops` came back empty would permanently delete every
+        // coplanar face in this set with nothing to replace them.
+        let new_faces = self.resplit_loops(plane, loops, &protected_holes);
+        if new_faces.is_empty() {
+            return Vec::new();
+        }
+
         for fid in &coplanar_face_ids {
             self.erase_face(*fid);
         }
 
-        self.resplit_loops(plane, loops, &protected_holes)
+        new_faces
     }
 
     /// Inline-offsets `face_id`'s outer boundary inward by `offset` (in
@@ -243,6 +272,53 @@ impl Document {
         let origin = self.mesh.position(face.outer[0]);
         let plane = Plane::from_normal(origin, face.normal);
 
+        // A loop sketched "on" this face must actually lie within its
+        // boundary. The frontend resolves which face a click landed on with
+        // a single raycast, which is ambiguous exactly on a shared
+        // vertex/edge between two faces - the same spot a snapped corner
+        // (an existing vertex, edge midpoint, or measure-tool guide) is
+        // most likely to land on. When that raycast resolves to the "wrong"
+        // neighboring face, the rest of the shape - sized from screen
+        // positions the user intended for a completely different plane -
+        // ends up mostly or entirely outside `face_id`'s own outline.
+        // `face_detect`'s planar graph can only represent loops that touch
+        // an existing boundary at shared vertices, not ones whose edges
+        // cross it, and silently corrupts the resulting geometry instead of
+        // erroring cleanly when that happens. Reject rather than corrupt -
+        // matching `inset_face`'s no-op-on-invalid-input pattern - and let
+        // the small tolerance still allow the common, legitimate case of a
+        // corner sketched exactly on this face's own edge or corner.
+        const FACE_FIT_TOLERANCE: f64 = 1e-2;
+        let outer_2d: Vec<DVec2> = face.outer.iter().map(|&v| plane.to_2d(self.mesh.position(v))).collect();
+        for loop_vertices in &extra_loops {
+            for &vid in loop_vertices {
+                let p = plane.to_2d(self.mesh.position(vid));
+                if !face_detect::point_in_or_near_polygon(p, &outer_2d, FACE_FIT_TOLERANCE) {
+                    return Vec::new();
+                }
+            }
+        }
+
+        // Weld `extra_loops` onto `face_id`'s whole connected solid, not
+        // just this one face's own boundary. A corner sketched on this face
+        // and snapped onto a vertex/edge/guide on a *different, adjacent*
+        // face of the same solid (e.g. building a stepped greeble, where
+        // each new level's corner is snapped onto the previous level's rim)
+        // is a brand new `VertexId` at a position a hair off that other
+        // face's vertex - see `Mesh::WELD_TOLERANCE`. `face_id`'s own
+        // boundary/holes are already covered below (their vertices are
+        // included in the connected-solid set too), so this is what makes
+        // that cross-face case connect instead of leaving a sliver of open
+        // edge right at the seam a guide was used to align. Scoped to the
+        // connected solid (not the whole mesh) so this can't reach into an
+        // unrelated, independently-drawn object that merely happens to
+        // share a coordinate (e.g. two separate parts both starting at the
+        // origin) - `resplit_plane`'s own coplanar-and-non-solid scoping
+        // handles that case correctly already and must stay that way.
+        let solid_vertices = self.connected_component_vertices(face_id);
+        let extra_loops: Vec<Vec<VertexId>> =
+            extra_loops.into_iter().map(|loop_verts| self.weld_loop_onto(loop_verts, &solid_vertices)).collect();
+
         // A hole in this face is there because something else already closes
         // it - most often a push/pulled stud or recess whose wall meets this
         // face at exactly that rim. Re-detecting over this face's loops would
@@ -255,13 +331,38 @@ impl Document {
         let protected_holes = face.holes.clone();
         let mut loops = vec![face.outer.clone()];
         loops.extend(face.holes.iter().cloned());
-        loops.extend(extra_loops);
+        loops.extend(extra_loops.iter().cloned());
+
+        // `resplit_loops` only reads vertex positions and creates new faces
+        // via `add_face` - it never touches `face_id` itself - so it's safe
+        // to run before erasing the source face. That ordering matters: if
+        // face_detect's half-edge tracing hits a degenerate/ambiguous
+        // configuration it has no representation for and comes back with
+        // nothing, erasing first would delete `face_id` with nothing to
+        // replace it - a real "face disappeared" data-loss bug, not just a
+        // rejected draw.
+        let new_faces = self.resplit_loops(&plane, loops, &protected_holes);
+        if new_faces.is_empty() {
+            return Vec::new();
+        }
+
+        // `face_detect::split_edges_at_interior_points` may have just split
+        // one of `face_id`'s own boundary/hole edges at a T-junction where
+        // `extra_loops` touches it partway along (e.g. a rectangle sketched
+        // flush into the corner of this face - the everyday "stud in the
+        // corner of a box top" move). If `face_id` is on a solid's boundary,
+        // any OTHER face of that same solid sharing that exact edge (a wall
+        // meeting this face at its rim) still has the old, unsplit edge -
+        // propagate the same split to it, or its untouched edge loses its
+        // manifold pairing with this face's newly-split one and the solid
+        // gets an open edge. Must run before `erase_face` below, while
+        // `face_id`'s own (pre-split) boundary is still there to read.
+        self.propagate_boundary_split_to_solid_siblings(face_id, &extra_loops, &new_faces);
 
         let was_grouped = self.face_to_group.get(&face_id).copied();
         let was_solid = self.solid_face_ids.contains(&face_id);
         self.erase_face(face_id);
 
-        let new_faces = self.resplit_loops(&plane, loops, &protected_holes);
         if let Some(group_id) = was_grouped {
             if let Some(group) = self.groups.get_mut(group_id) {
                 group.face_ids.extend(&new_faces);
@@ -274,6 +375,184 @@ impl Document {
             self.solid_face_ids.extend(&new_faces);
         }
         new_faces
+    }
+
+    /// Every vertex referenced by any face in the same connected component
+    /// (see `Mesh::connected_components`) as `face_id` - i.e. the whole
+    /// solid (or flat coplanar sketch group) `face_id` is currently part of,
+    /// not just `face_id`'s own boundary. Used to scope which existing
+    /// vertices a freshly-drawn loop is allowed to weld onto (see
+    /// `weld_loop_onto`); deliberately not "every vertex in the mesh", so an
+    /// unrelated, independently-drawn object can never be pulled in just
+    /// because it happens to share a coordinate.
+    fn connected_component_vertices(&self, face_id: FaceId) -> Vec<VertexId> {
+        let all_face_ids: Vec<FaceId> = self.mesh.faces.keys().collect();
+        let component = self
+            .mesh
+            .connected_components(&all_face_ids)
+            .into_iter()
+            .find(|c| c.contains(&face_id))
+            .unwrap_or_default();
+        component
+            .into_iter()
+            .flat_map(|fid| {
+                let face = &self.mesh.faces[fid];
+                face.outer.iter().copied().chain(face.holes.iter().flatten().copied())
+            })
+            .collect()
+    }
+
+    /// Replaces any vertex in `loop_verts` that lies within
+    /// `Mesh::WELD_TOLERANCE` of a vertex in `candidates` with that existing
+    /// vertex id; every other vertex passes through unchanged. `candidates`
+    /// is deliberately scoped by the caller (see `connected_component_vertices`)
+    /// rather than searching the whole mesh, so this only ever connects a new
+    /// loop to geometry the current operation is actually meant to touch.
+    fn weld_loop_onto(&self, loop_verts: Vec<VertexId>, candidates: &[VertexId]) -> Vec<VertexId> {
+        loop_verts
+            .into_iter()
+            .map(|vid| {
+                let p = self.mesh.position(vid);
+                candidates
+                    .iter()
+                    .copied()
+                    .find(|&c| (self.mesh.position(c) - p).length_squared() < Mesh::WELD_TOLERANCE * Mesh::WELD_TOLERANCE)
+                    .unwrap_or(vid)
+            })
+            .collect()
+    }
+
+    /// Finds every point in `extra_loops` that lands on the interior of one
+    /// of `face_id`'s own boundary/hole edges (a T-junction -
+    /// `face_detect::split_edges_at_interior_points` is about to split that
+    /// edge on `face_id`'s side), and inserts the same point(s), in the same
+    /// order, into the matching edge of every OTHER pre-existing face in the
+    /// same connected solid (`just_created` - this same call's own
+    /// replacement faces, already built from the already-split edge graph -
+    /// is excluded, or its already-correct boundary would get a redundant,
+    /// corrupting duplicate vertex inserted into it). Faces don't share
+    /// topology in this mesh (see `Mesh`'s struct doc comment) - each keeps
+    /// its own independent loop of vertex ids - so splitting `face_id`'s
+    /// side of a shared rim without also updating the neighbor's side leaves
+    /// that neighbor's untouched edge with no matching reverse-direction
+    /// pairing anywhere any more: exactly the open-edge/"not watertight"
+    /// corruption this exists to prevent.
+    ///
+    /// Deliberately a no-op for a `face_id` that isn't on a solid's
+    /// boundary. Flat sketches left adjacent by an earlier `resplit_plane`
+    /// *do* share edges with each other, so the neighbor really is left
+    /// holding a stale, unsplit copy - but nothing pairs edges across two
+    /// flat sketches. Each extrudes into its own independently closed solid
+    /// built from its own loop, so the mismatch never becomes a manifold
+    /// error (pinned by
+    /// `a_t_junction_on_an_edge_shared_between_two_flat_sketches_survives_extrusion`).
+    /// Propagating there anyway would reach across two *unrelated* sketches
+    /// that merely touch, which is the over-broad behavior
+    /// `connected_component_vertices` exists to avoid.
+    fn propagate_boundary_split_to_solid_siblings(
+        &mut self,
+        face_id: FaceId,
+        extra_loops: &[Vec<VertexId>],
+        just_created: &[FaceId],
+    ) {
+        if !self.solid_face_ids.contains(&face_id) {
+            return;
+        }
+        let Some(face) = self.mesh.faces.get(face_id) else {
+            return;
+        };
+        let plane = Plane::from_normal(self.mesh.position(face.outer[0]), face.normal);
+        let rings: Vec<Vec<VertexId>> = std::iter::once(face.outer.clone()).chain(face.holes.iter().cloned()).collect();
+
+        // For each of face_id's own directed boundary edges (a -> b), every
+        // new point from `extra_loops` landing on its interior, in order.
+        let mut splits: Vec<(VertexId, VertexId, Vec<VertexId>)> = Vec::new();
+        for ring in &rings {
+            let n = ring.len();
+            for i in 0..n {
+                let a = ring[i];
+                let b = ring[(i + 1) % n];
+                let pa = plane.to_2d(self.mesh.position(a));
+                let pb = plane.to_2d(self.mesh.position(b));
+                let ab = pb - pa;
+                let len_sq = ab.length_squared();
+                if len_sq < 1e-18 {
+                    continue;
+                }
+                let mut on_edge: Vec<(VertexId, f64)> = Vec::new();
+                for loop_verts in extra_loops {
+                    for &vid in loop_verts {
+                        if vid == a || vid == b {
+                            continue;
+                        }
+                        let p = plane.to_2d(self.mesh.position(vid));
+                        let t = (p - pa).dot(ab) / len_sq;
+                        if !(1e-9..=1.0 - 1e-9).contains(&t) {
+                            continue;
+                        }
+                        let closest = pa + ab * t;
+                        if (p - closest).length_squared() < Mesh::WELD_TOLERANCE * Mesh::WELD_TOLERANCE {
+                            on_edge.push((vid, t));
+                        }
+                    }
+                }
+                if on_edge.is_empty() {
+                    continue;
+                }
+                on_edge.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap());
+                on_edge.dedup_by_key(|&mut (v, _)| v);
+                splits.push((a, b, on_edge.into_iter().map(|(v, _)| v).collect()));
+            }
+        }
+        if splits.is_empty() {
+            return;
+        }
+
+        let component_face_ids: Vec<FaceId> = self
+            .mesh
+            .connected_components(&self.mesh.faces.keys().collect::<Vec<_>>())
+            .into_iter()
+            .find(|c| c.contains(&face_id))
+            .unwrap_or_default();
+
+        for sibling_id in component_face_ids {
+            // `face_id` itself is about to be erased by the caller, and
+            // `just_created` (this same call's own replacement faces) were
+            // just built directly from the already-split edge graph - both
+            // already have the split point exactly where they need it, so
+            // touching either here would insert a redundant, corrupting
+            // duplicate vertex into an already-correct boundary.
+            if sibling_id == face_id || just_created.contains(&sibling_id) {
+                continue;
+            }
+            let Some(sibling) = self.mesh.faces.get_mut(sibling_id) else {
+                continue;
+            };
+            for ring in std::iter::once(&mut sibling.outer).chain(sibling.holes.iter_mut()) {
+                let n = ring.len();
+                if n < 2 {
+                    continue;
+                }
+                let mut new_ring = Vec::with_capacity(n);
+                let mut changed = false;
+                for i in 0..n {
+                    let x = ring[i];
+                    let y = ring[(i + 1) % n];
+                    new_ring.push(x);
+                    // A sibling sharing this rim traverses it in the
+                    // opposite direction (y -> x) under this app's
+                    // CCW-outward winding convention, so its matching split
+                    // is keyed on (b, a) = (y, x).
+                    if let Some((_, _, new_verts)) = splits.iter().find(|(a, b, _)| *a == y && *b == x) {
+                        new_ring.extend(new_verts.iter().rev().copied());
+                        changed = true;
+                    }
+                }
+                if changed {
+                    *ring = new_ring;
+                }
+            }
+        }
     }
 
     /// Builds the combined 2D edge graph for `loops` (each a closed ring of
@@ -293,6 +572,19 @@ impl Document {
         loops: Vec<Vec<VertexId>>,
         protected_holes: &[Vec<VertexId>],
     ) -> Vec<FaceId> {
+        // Two loops can reference *different* VertexIds at what's meant to
+        // be the same position - most commonly a freshly-drawn shape whose
+        // corner was snapped onto an existing vertex/edge/guide: the
+        // frontend only ever sends raw coordinates (never vertex ids), and
+        // those coordinates round-tripped through the f32 DocumentSnapshot
+        // on the way there and back, picking up a tiny rounding error
+        // relative to the vertex's true f64 position. Without a weld here,
+        // `face_detect`'s neighbor-angle sort sees two almost-but-not-quite
+        // coincident points and produces an essentially arbitrary ordering
+        // between them, splicing unrelated edges into a self-intersecting
+        // face. See `Mesh::WELD_TOLERANCE` for why 1e-3mm.
+        let weld_eps_sq = Mesh::WELD_TOLERANCE * Mesh::WELD_TOLERANCE;
+
         let mut index_of: HashMap<VertexId, usize> = HashMap::new();
         let mut points: Vec<DVec2> = Vec::new();
         let mut vertex_by_index: Vec<VertexId> = Vec::new();
@@ -302,11 +594,28 @@ impl Document {
             let local_indices: Vec<usize> = loop_vertices
                 .iter()
                 .map(|&vid| {
-                    *index_of.entry(vid).or_insert_with(|| {
-                        points.push(plane.to_2d(self.mesh.position(vid)));
-                        vertex_by_index.push(vid);
-                        points.len() - 1
-                    })
+                    if let Some(&i) = index_of.get(&vid) {
+                        return i;
+                    }
+                    let p = plane.to_2d(self.mesh.position(vid));
+                    // Loops are processed in the order the caller built
+                    // `loops` in - the source face's own pre-existing
+                    // boundary/holes always come before any newly-drawn loop
+                    // (see `resplit_plane`/`resplit_face_with_loops`), so a
+                    // match here always keeps the pre-existing vertex - the
+                    // one an adjacent, untouched face may still reference at
+                    // that same corner, which is what keeps the mesh
+                    // watertight there.
+                    let i = points
+                        .iter()
+                        .position(|&q| (q - p).length_squared() < weld_eps_sq)
+                        .unwrap_or_else(|| {
+                            points.push(p);
+                            vertex_by_index.push(vid);
+                            points.len() - 1
+                        });
+                    index_of.insert(vid, i);
+                    i
                 })
                 .collect();
             let n = local_indices.len();
@@ -321,7 +630,7 @@ impl Document {
             .into_iter()
             .filter_map(|df| {
                 let outer: Vec<VertexId> = df.outer.iter().map(|&i| vertex_by_index[i]).collect();
-                if matches_any_loop(&outer, protected_holes) {
+                if loop_covers_any(&outer, protected_holes) {
                     return None;
                 }
                 let holes: Vec<Vec<VertexId>> = df
@@ -557,6 +866,14 @@ impl Document {
         }
     }
 
+    pub fn add_guide(&mut self, a: DVec3, b: DVec3) {
+        self.guides.push(Guide { a, b });
+    }
+
+    pub fn clear_guides(&mut self) {
+        self.guides.clear();
+    }
+
     pub fn select(&mut self, face_ids: &[FaceId]) {
         self.selection.faces = face_ids.iter().copied().collect();
     }
@@ -781,6 +1098,7 @@ impl Document {
             faces,
             groups,
             selected_face_ids: self.selection.faces.iter().copied().collect(),
+            guides: self.guides.clone(),
         }
     }
 
@@ -816,7 +1134,7 @@ impl Document {
             })
             .collect();
 
-        ProjectFile { vertices, faces, groups }
+        ProjectFile { vertices, faces, groups, guides: self.guides.clone() }
     }
 
     /// Rebuilds a document from a loaded project file, re-interning every
@@ -878,6 +1196,8 @@ impl Document {
             doc.group_faces(&member_ids, group.name.clone());
         }
 
+        doc.guides = project.guides.iter().copied().filter(|g| g.a.is_finite() && g.b.is_finite()).collect();
+
         doc
     }
 }
@@ -934,6 +1254,41 @@ fn matches_any_loop(subject: &[VertexId], candidates: &[Vec<VertexId>]) -> bool 
         .any(|c| c.len() == subject.len() && c.iter().all(|v| subject_set.contains(v)))
 }
 
+/// Whether `subject` traces a ring that covers all of some candidate's
+/// vertices - the same test as `matches_any_loop`, but tolerating `subject`
+/// carrying *extra* vertices the candidate doesn't have.
+///
+/// Used only to decide whether a freshly detected region is one of the
+/// `protected_holes` that must stay empty. It cannot be an exact comparison,
+/// because `face_detect::split_edges_at_interior_points` inserts a vertex
+/// into any edge a newly-drawn loop touches partway along (a T-junction), so
+/// the region re-traced for a protected hole legitimately comes back one or
+/// more vertices longer than the hole recorded before the split. A sketch
+/// whose corner lands on an existing stud's rim does exactly that; comparing
+/// by exact length there silently un-protected the rim and refilled it with a
+/// face duplicating every edge the stud's wall already pairs with (see
+/// `a_sketch_touching_an_existing_studs_rim_does_not_refill_that_rim`).
+///
+/// A false positive here *drops* a face, so the looser test has to stay
+/// tight in that direction - and it does: the detected regions partition the
+/// source face's area with the hole excluded from it, so the only region that
+/// can contain *every* vertex of a hole's loop is that hole's own region. A
+/// neighboring region touches only part of the loop, and a region enclosing
+/// the hole carries it among its `holes` rather than in its outer.
+///
+/// Deliberately not folded into `matches_any_loop`: that one also answers
+/// "did an erased face fill this hole" in `resplit_plane`, where a smaller
+/// candidate loop genuinely is a different loop and must not match.
+fn loop_covers_any(subject: &[VertexId], candidates: &[Vec<VertexId>]) -> bool {
+    if candidates.is_empty() {
+        return false;
+    }
+    let subject_set: HashSet<VertexId> = subject.iter().copied().collect();
+    candidates
+        .iter()
+        .any(|c| c.len() <= subject.len() && c.iter().all(|v| subject_set.contains(v)))
+}
+
 /// A face is coplanar with `plane` when it faces the same way (not the
 /// opposite side of the same plane) and every one of its outer-loop vertices
 /// lies on it within tolerance.
@@ -977,6 +1332,10 @@ pub struct DocumentSnapshot {
     pub faces: Vec<FaceSnapshot>,
     pub groups: Vec<GroupSnapshot>,
     pub selected_face_ids: Vec<FaceId>,
+    /// Kept as f64 (unlike `vertices`, which is f32 because it feeds a GPU
+    /// buffer) - there are only ever a handful of guides, so no conversion
+    /// code here is simpler than some.
+    pub guides: Vec<Guide>,
 }
 
 /// One offending edge, in world coordinates rather than as indices into
@@ -1741,6 +2100,418 @@ mod tests {
     }
 
     #[test]
+    fn drawing_on_a_face_with_a_corner_nearly_matching_an_existing_vertex_does_not_corrupt_the_face() {
+        // Regression test: snapping a new shape's corner onto an existing
+        // vertex (endpoint/edge/guide snap) sends only raw coordinates, and
+        // those round-trip through the f32 DocumentSnapshot on the way to
+        // the frontend and back - so the value that arrives back at
+        // `draw_polygon` is very close to, but not bit-identical to, the
+        // existing vertex's true f64 position. Before `resplit_loops` welded
+        // near-duplicate points, this produced two almost-coincident-but-
+        // distinct points feeding face_detect's neighbor-angle sort, which
+        // spliced unrelated edges together into a self-intersecting face
+        // instead of a clean split.
+        //
+        // Uses a triangle (via `draw_polygon`), not a rectangle: two
+        // axis-aligned rectangles sharing a corner in the same basis always
+        // have collinear edges there, which is a related but separate
+        // T-junction case `face_detect::split_edges_at_interior_points`
+        // handles - see
+        // `a_rectangle_sharing_a_corner_with_its_target_face_splits_it_correctly`.
+        // This test isolates the welding behavior specifically, so its
+        // edges must not be collinear with the target face's own
+        // axis-aligned boundary.
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), None)[0];
+        let box_faces = doc.push_pull(sketch_id, 4.0);
+        let top_id = box_faces.iter().copied().find(|&fid| doc.mesh.faces[fid].normal.z > 0.9).unwrap();
+
+        let top = doc.mesh.faces[top_id].clone();
+        let top_plane = Plane::from_normal(doc.mesh.position(top.outer[0]), top.normal);
+        let outer_2d: Vec<DVec2> = top.outer.iter().map(|&v| top_plane.to_2d(doc.mesh.position(v))).collect();
+        // A brand new VertexId at the very same position as an existing
+        // corner - the near-duplicate scenario itself, not a proxy for it -
+        // plus two more points chosen so neither triangle edge from it is
+        // axis-aligned.
+        let corner_2d = outer_2d[0];
+        let triangle = vec![corner_2d, corner_2d + DVec2::new(3.0, 1.0), corner_2d + DVec2::new(1.0, 3.0)];
+
+        let new_faces = doc.draw_polygon(&top_plane, triangle, Some(top_id));
+
+        assert_eq!(new_faces.len(), 2, "the top face should split into a framed hole + an inner panel");
+        for &fid in &new_faces {
+            let face = &doc.mesh.faces[fid];
+            assert!(face.outer.len() >= 3);
+            for &vid in &face.outer {
+                assert!(
+                    (doc.mesh.position(vid).z - 4.0).abs() < 1e-6,
+                    "a corrupted split would pull vertices off the top face's own plane"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn studs_on_two_adjacent_faces_snapped_to_the_same_corner_stay_watertight() {
+        // Sanity check for a "staircase" build: sketching on one face,
+        // snapping a corner onto an existing box corner, pushing/pulling
+        // into a stud, then separately sketching on the *adjacent* face and
+        // snapping another corner onto that same box corner. Each sketch is
+        // its own `resplit_face_with_loops` call - `connected_component_vertices`
+        // is what lets the second sketch's near-duplicate corner weld onto
+        // the first face's own (unchanged) copy of that vertex rather than
+        // creating an unrelated one. Note this doesn't by itself prove the
+        // weld is *necessary*: each stud's own wall+cap is a self-contained
+        // closed shape regardless of which vertex its base welds to, so
+        // `is_manifold` alone can pass even without the connected-solid
+        // weld in cases like this one. Kept as coverage for the scenario the
+        // fix targets, not as a red/green proof of it.
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), None)[0];
+        let box_faces = doc.push_pull(sketch_id, 4.0);
+        let top_id = box_faces.iter().copied().find(|&fid| doc.mesh.faces[fid].normal.z > 0.9).unwrap();
+        let wall_id = box_faces
+            .iter()
+            .copied()
+            .find(|&fid| doc.mesh.faces[fid].normal.z.abs() < 0.01)
+            .unwrap();
+
+        let top = doc.mesh.faces[top_id].clone();
+        let wall = doc.mesh.faces[wall_id].clone();
+        let wall_vertices: HashSet<VertexId> = wall.outer.iter().copied().collect();
+        let shared = *top.outer.iter().find(|v| wall_vertices.contains(v)).expect("top and wall share an edge");
+        let corner = doc.mesh.position(shared);
+
+        // Two different tiny nudges, both well under Mesh::WELD_TOLERANCE -
+        // standing in for two *separate* f32-DocumentSnapshot round trips
+        // (each sketch's corner snap is its own frontend round trip, so
+        // there's no reason they'd land on the exact same rounding error).
+        let near_1 = corner + DVec3::new(2e-5, -3e-5, 1e-5);
+        let near_2 = corner + DVec3::new(-1e-5, 2e-5, -2e-5);
+
+        // A small, non-axis-aligned triangle anchored at `corner_2d`, built
+        // generically from the target face's own outline so it works for
+        // any convex face regardless of size or orientation - the corner-to-
+        // centroid direction is used (not a rectangle's own axes) to isolate
+        // the cross-face weld from the separate T-junction case
+        // `a_rectangle_sharing_a_corner_with_its_target_face_splits_it_correctly`
+        // covers.
+        fn stud_triangle(mesh: &Mesh, plane: &Plane, outer: &[VertexId], corner_3d: DVec3) -> Vec<DVec2> {
+            let outer_2d: Vec<DVec2> = outer.iter().map(|&v| plane.to_2d(mesh.position(v))).collect();
+            let centroid = outer_2d.iter().fold(DVec2::ZERO, |acc, &p| acc + p) / outer_2d.len() as f64;
+            let corner_2d = plane.to_2d(corner_3d);
+            let nearest = (0..outer_2d.len())
+                .min_by(|&a, &b| {
+                    (outer_2d[a] - corner_2d).length_squared().partial_cmp(&(outer_2d[b] - corner_2d).length_squared()).unwrap()
+                })
+                .unwrap();
+            let adjacent = outer_2d[(nearest + 1) % outer_2d.len()];
+            // Convex combinations of corner/centroid/adjacent-vertex stay
+            // inside any convex polygon regardless of aspect ratio - unlike
+            // a perpendicular offset sized off the corner-to-centroid
+            // vector, which overshoots a short dimension on an elongated
+            // (e.g. wide, short) face.
+            let p1 = corner_2d * 0.7 + centroid * 0.3;
+            let p2 = corner_2d * 0.7 + adjacent * 0.15 + centroid * 0.15;
+            vec![corner_2d, p1, p2]
+        }
+
+        let top_plane = Plane::from_normal(doc.mesh.position(top.outer[0]), top.normal);
+        let stud_a = doc.draw_polygon(&top_plane, stud_triangle(&doc.mesh, &top_plane, &top.outer, near_1), Some(top_id));
+        assert_eq!(stud_a.len(), 2, "top face should split into a framed hole + inner panel");
+        let stud_a_cap = stud_a
+            .iter()
+            .copied()
+            .find(|&fid| doc.mesh.faces[fid].holes.is_empty())
+            .expect("the inner panel (no holes) is the new stud's cap");
+        doc.push_pull_faces(&[stud_a_cap], 1.0);
+
+        let wall_plane = Plane::from_normal(doc.mesh.position(wall.outer[0]), wall.normal);
+        let stud_b =
+            doc.draw_polygon(&wall_plane, stud_triangle(&doc.mesh, &wall_plane, &wall.outer, near_2), Some(wall_id));
+        assert_eq!(stud_b.len(), 2, "wall should split into a framed hole + inner panel");
+        let stud_b_cap = stud_b
+            .iter()
+            .copied()
+            .find(|&fid| doc.mesh.faces[fid].holes.is_empty())
+            .expect("the inner panel (no holes) is the new stud's cap");
+        doc.push_pull_faces(&[stud_b_cap], 1.0);
+
+        let solids = doc.solid_boundary_face_ids();
+        assert!(pushpull::is_manifold(&doc.mesh, &solids), "two studs snapped to the same corner must stay watertight");
+    }
+
+    #[test]
+    fn a_rectangle_sharing_a_corner_with_its_target_face_splits_it_correctly() {
+        // Two axis-aligned rectangles sharing a corner - the "stud built
+        // into the corner of a box's top face" workflow, and the most basic
+        // way to snap a new sketch onto existing geometry (an endpoint,
+        // edge, or measure-tool guide snap all reach this shape
+        // identically). Always produces two pairs of exactly-collinear
+        // edges at the shared corner, which used to tie `face_detect`'s
+        // neighbor-angle sort with no tiebreaker and force a safe-but-wrong
+        // no-op rejection of an extremely common, valid draw. Fixed by
+        // `face_detect::split_edges_at_interior_points`, which splits the
+        // target face's long edges at the new rectangle's T-junction points
+        // before tracing, removing the tie instead of merely detecting and
+        // rejecting it.
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), None)[0];
+        let box_faces = doc.push_pull(sketch_id, 4.0);
+        let top_id = box_faces.iter().copied().find(|&fid| doc.mesh.faces[fid].normal.z > 0.9).unwrap();
+
+        let top = doc.mesh.faces[top_id].clone();
+        let top_plane = Plane::from_normal(doc.mesh.position(top.outer[0]), top.normal);
+        let corner_2d = top_plane.to_2d(doc.mesh.position(top.outer[0]));
+
+        let new_faces = doc.draw_rectangle(&top_plane, corner_2d, corner_2d + DVec2::new(5.0, 5.0), Some(top_id));
+
+        assert_eq!(new_faces.len(), 2, "the corner-stud footprint and the remaining L-shaped area");
+        assert!(!doc.mesh.faces.contains_key(top_id), "the original top face is replaced by the split");
+        for &fid in &new_faces {
+            for &vid in &doc.mesh.faces[fid].outer {
+                assert!(
+                    (doc.mesh.position(vid).z - 4.0).abs() < 1e-6,
+                    "a corrupted split would pull vertices off the top face's own plane"
+                );
+            }
+        }
+        let report = doc.check_model();
+        assert_eq!(report.broken_part_count, 0, "the split must stay watertight");
+    }
+
+    #[test]
+    fn a_t_junction_on_an_edge_shared_between_two_flat_sketches_survives_extrusion() {
+        // `propagate_boundary_split_to_solid_siblings` early-returns for a
+        // `face_id` that isn't on a solid's boundary. Two *flat* sketches
+        // left adjacent by an earlier `resplit_plane` do share an edge, so
+        // splitting one of them at a T-junction leaves the other's copy of
+        // that edge unsplit - and nothing propagates it. This pins what that
+        // actually costs once both are extruded into real solids, which is
+        // the point at which a stale shared edge would matter.
+        let mut doc = Document::new();
+        let ground = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        doc.draw_rectangle(&ground, DVec2::ZERO, DVec2::new(20.0, 20.0), None);
+        // Splits the sheet into a 10x10 square and a concave L-shape, both
+        // flat sketches sharing the edges at x=10 and y=10.
+        doc.draw_rectangle(&ground, DVec2::ZERO, DVec2::new(10.0, 10.0), None);
+
+        let flat_face = |doc: &Document, want_len: usize| -> FaceId {
+            doc.mesh
+                .faces
+                .iter()
+                .find(|(id, f)| f.outer.len() == want_len && !doc.solid_face_ids.contains(id))
+                .map(|(id, _)| id)
+                .expect("a flat sketch face with that many corners")
+        };
+        let l_shape = flat_face(&doc, 6);
+
+        // (10, 5) sits on the L's own edge - and on the square's copy of it.
+        let split = doc.draw_rectangle(&ground, DVec2::new(10.0, 5.0), DVec2::new(15.0, 2.0), Some(l_shape));
+        assert!(!split.is_empty(), "a T-junction sketch on a flat face must still be accepted");
+
+        let square = flat_face(&doc, 4);
+        doc.push_pull(square, 3.0);
+        let report = doc.check_model();
+        assert_eq!(
+            report.broken_part_count, 0,
+            "extruding the un-propagated neighbor must still produce a watertight solid: {} duplicate, {} open",
+            report.duplicate_edges.len(),
+            report.open_edges.len()
+        );
+    }
+
+    #[test]
+    fn a_second_corner_stud_on_the_resulting_concave_face_stays_watertight() {
+        // Chained splits: after the first corner stud, the remaining top
+        // face is a concave L-shape, and the second corner stud's
+        // T-junctions land on *its* edges - so this exercises the split,
+        // the sibling propagation and the collinear-aware triangulation
+        // against a non-convex target face, and against a face that is
+        // itself the product of an earlier split rather than a pristine
+        // rectangle.
+        let mut doc = Document::new();
+        let ground = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let sketch_id = doc.draw_rectangle(&ground, DVec2::ZERO, DVec2::new(20.0, 20.0), None)[0];
+        doc.push_pull(sketch_id, 4.0);
+        let top_plane = Plane::from_normal(DVec3::new(0.0, 0.0, 4.0), DVec3::Z);
+        let cap_at_z4 = |doc: &Document| -> FaceId {
+            doc.mesh
+                .faces
+                .iter()
+                .find(|(_, f)| f.normal.z > 0.9 && (doc.mesh.position(f.outer[0]).z - 4.0).abs() < 1e-9)
+                .map(|(id, _)| id)
+                .expect("a top face at z=4")
+        };
+
+        let split_1 = doc.draw_rectangle(&top_plane, DVec2::ZERO, DVec2::new(8.0, 8.0), Some(cap_at_z4(&doc)));
+        assert_eq!(split_1.len(), 2, "corner stud footprint + concave remainder");
+        let stud_1 = split_1.iter().copied().find(|&f| doc.mesh.faces[f].outer.len() == 4).unwrap();
+        doc.push_pull(stud_1, 3.0);
+        assert_eq!(doc.check_model().broken_part_count, 0, "precondition: the first corner stud is watertight");
+
+        // The remaining face is now an L-shape. Put the second stud in the
+        // diagonally opposite corner, so both its T-junctions land on the
+        // L's own (post-split) edges.
+        let l_face = cap_at_z4(&doc);
+        assert_eq!(doc.mesh.faces[l_face].outer.len(), 6, "the remainder really is the concave L-shape");
+        let split_2 =
+            doc.draw_rectangle(&top_plane, DVec2::new(12.0, 12.0), DVec2::new(20.0, 20.0), Some(l_face));
+        assert_eq!(split_2.len(), 2, "the concave face must split, not be rejected");
+        let stud_2 = split_2.iter().copied().find(|&f| doc.mesh.faces[f].outer.len() == 4).unwrap();
+        doc.push_pull(stud_2, 5.0);
+
+        let report = doc.check_model();
+        assert_eq!(
+            report.broken_part_count, 0,
+            "chained corner studs must stay watertight: {} duplicate, {} open",
+            report.duplicate_edges.len(),
+            report.open_edges.len()
+        );
+    }
+
+    #[test]
+    fn a_sketch_touching_an_existing_studs_rim_does_not_refill_that_rim() {
+        // A T-junction landing on one of the target face's *hole* edges (not
+        // its outer boundary): draw a stud on a box top, then draw a second
+        // sketch on the remaining top face with a corner snapped onto the
+        // middle of the first stud's rim - exactly the alignment a
+        // measure-tool guide invites.
+        //
+        // `split_edges_at_interior_points` splits that rim edge, so the
+        // re-detected loop for the hole region comes back with one MORE
+        // vertex than the `protected_holes` entry recorded before the split.
+        // `matches_any_loop` compares by exact length, so the protection
+        // silently stops matching and the hole gets refilled with a face -
+        // duplicating every edge the stud's wall already pairs with.
+        let mut doc = Document::new();
+        let ground = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let sketch_id = doc.draw_rectangle(&ground, DVec2::ZERO, DVec2::new(20.0, 20.0), None)[0];
+        doc.push_pull(sketch_id, 4.0);
+
+        let top_plane = Plane::from_normal(DVec3::new(0.0, 0.0, 4.0), DVec3::Z);
+        let cap_id = |doc: &Document| -> FaceId {
+            doc.mesh
+                .faces
+                .iter()
+                .find(|(_, f)| f.normal.z > 0.9 && (doc.mesh.position(f.outer[0]).z - 4.0).abs() < 1e-9)
+                .map(|(id, _)| id)
+                .expect("the box's top cap")
+        };
+
+        // A rectangular stud in the middle of the top face, leaving the cap
+        // with a 4-vertex hole at its rim.
+        let split = doc.draw_rectangle(&top_plane, DVec2::new(5.0, 5.0), DVec2::new(15.0, 15.0), Some(cap_id(&doc)));
+        let stud_cap = split.iter().copied().find(|&fid| doc.mesh.faces[fid].holes.is_empty()).unwrap();
+        doc.push_pull(stud_cap, 3.0);
+        assert_eq!(doc.check_model().broken_part_count, 0, "precondition: one stud on a box is watertight");
+
+        // (10, 5) sits exactly halfway along the rim edge (5,5)->(15,5).
+        // The rest of the rectangle stays clear of the hole (y <= 5).
+        doc.draw_rectangle(&top_plane, DVec2::new(10.0, 5.0), DVec2::new(18.0, 2.0), Some(cap_id(&doc)));
+
+        let report = doc.check_model();
+        assert_eq!(
+            report.broken_part_count, 0,
+            "touching a stud's rim must not refill it: {} duplicate edge(s), {} open edge(s)",
+            report.duplicate_edges.len(),
+            report.open_edges.len()
+        );
+
+        // The cap now carries a *merged* hole (the rim fused with the new
+        // sketch's footprint, see `face_detect::merge_holes_sharing_an_edge`).
+        // Resplitting it again has to keep protecting that fused loop: it is
+        // fed back in as one ring, so it re-traces as one region and
+        // `matches_any_loop` still recognizes it. A third sketch elsewhere on
+        // the cap is what proves the merge didn't break hole protection.
+        doc.draw_rectangle(&top_plane, DVec2::new(2.0, 16.0), DVec2::new(8.0, 19.0), Some(cap_id(&doc)));
+        let report = doc.check_model();
+        assert_eq!(
+            report.broken_part_count, 0,
+            "a later sketch must not refill the merged hole: {} duplicate edge(s), {} open edge(s)",
+            report.duplicate_edges.len(),
+            report.open_edges.len()
+        );
+    }
+
+    #[test]
+    fn pushing_a_corner_stud_sketch_into_a_real_stud_stays_watertight() {
+        // The actual end-to-end workflow the previous test's flat split is
+        // a building block for: sketch a rectangle flush into a box top's
+        // corner, then push/pull the resulting inner panel up into a real
+        // 3D stud. Exercises the T-junction split
+        // (`face_detect::split_edges_at_interior_points`) and the sibling
+        // propagation (`Document::propagate_boundary_split_to_solid_siblings`)
+        // together with a second level of extrusion on top, which is what
+        // actually stresses the wall's now-pentagonal boundary
+        // (`triangulate::on_segment_interior` is what keeps that pentagon's
+        // own triangulation from silently skipping the T-junction vertex).
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), None)[0];
+        let box_faces = doc.push_pull(sketch_id, 4.0);
+        let top_id = box_faces.iter().copied().find(|&fid| doc.mesh.faces[fid].normal.z > 0.9).unwrap();
+        let top = doc.mesh.faces[top_id].clone();
+        let top_plane = Plane::from_normal(doc.mesh.position(top.outer[0]), top.normal);
+        let corner_2d = top_plane.to_2d(doc.mesh.position(top.outer[0]));
+
+        let new_faces = doc.draw_rectangle(&top_plane, corner_2d, corner_2d + DVec2::new(5.0, 5.0), Some(top_id));
+        let stud_cap = new_faces
+            .iter()
+            .copied()
+            .find(|&fid| doc.mesh.faces[fid].outer.len() == 4)
+            .expect("the corner-stud footprint (no holes, 4 corners)");
+        doc.push_pull(stud_cap, 3.0);
+
+        let report = doc.check_model();
+        assert_eq!(report.broken_part_count, 0, "a stud pushed up from a T-junction split must stay watertight");
+    }
+
+    #[test]
+    fn resplitting_a_face_with_a_loop_that_lands_on_the_wrong_neighboring_face_is_rejected() {
+        // Reproduces a real bug: the frontend picks which face a click
+        // "landed on" with a single raycast, which is ambiguous exactly on
+        // a vertex/edge shared between two faces - precisely where a
+        // snapped corner (an existing vertex, edge midpoint, or
+        // measure-tool guide) is most likely to land. When that raycast
+        // resolves to the wrong neighboring face, the rest of the shape -
+        // sized from screen positions the user intended for a completely
+        // different plane - ends up mostly or entirely outside the
+        // (wrongly) resolved target face's own boundary. Before the
+        // face-fit check, `resplit_face_with_loops` fed `face_detect` a
+        // loop whose edges crossed the target face's boundary instead of
+        // merely touching it, producing a self-intersecting, warped face
+        // (a large sheared "wing") in place of the target face - the
+        // "faces disappear" corruption a user reported after drawing on a
+        // face using a measure-tool guide landing on a shared corner.
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let sketch_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), None)[0];
+        let box_faces = doc.push_pull(sketch_id, 4.0);
+        let left_id = box_faces
+            .iter()
+            .copied()
+            .find(|&fid| doc.mesh.faces[fid].normal.z.abs() < 0.01 && doc.mesh.faces[fid].normal.x.abs() > 0.9)
+            .unwrap();
+        let faces_before = doc.mesh.faces.len();
+
+        // A loop shaped for the ground plane (spanning far beyond the LEFT
+        // face's own footprint) mistakenly resplit against the LEFT face -
+        // exactly what an ambiguous raycast at their shared corner produces.
+        let wrong_loop = doc.draw_rectangle(&plane, DVec2::new(0.0, 0.0), DVec2::new(20.0, 20.0), None);
+        let wrong_loop_vertices = doc.mesh.faces[wrong_loop[0]].outer.clone();
+        doc.mesh.remove_face(wrong_loop[0]);
+
+        let new_faces = doc.resplit_face_with_loops(left_id, vec![wrong_loop_vertices]);
+
+        assert!(new_faces.is_empty(), "a loop mostly outside the target face must be rejected, not corrupt it");
+        assert_eq!(doc.mesh.faces.len(), faces_before, "the document must be left exactly as it was");
+    }
+
+    #[test]
     fn pushing_a_face_drawn_on_a_solid_wall_stays_manifold() {
         // The porthole workflow end-to-end: sketch a rectangle on a wall,
         // then push it inward to carve a recess.
@@ -1850,6 +2621,7 @@ mod tests {
                 ProjectFace { outer: vec![0, 1, 2], holes: vec![vec![7]], solid: false },
             ],
             groups: vec![ProjectGroup { name: "g".to_string(), face_indices: vec![0, 42] }],
+            guides: vec![],
         };
 
         let doc = Document::from_project_file(&project);
@@ -1875,6 +2647,7 @@ mod tests {
                 ProjectFace { outer: vec![0, 1, 2], holes: vec![], solid: false },
             ],
             groups: vec![],
+            guides: vec![],
         };
 
         let doc = Document::from_project_file(&project);
@@ -1901,6 +2674,48 @@ mod tests {
         for (a, b) in original_positions.iter().zip(reloaded_positions.iter()) {
             assert!((*a - *b).length() < 1e-9);
         }
+    }
+
+    #[test]
+    fn guides_round_trip_through_the_project_file() {
+        let mut doc = Document::new();
+        doc.add_guide(DVec3::new(1.0, 2.0, 3.0), DVec3::new(4.0, 5.0, 6.0));
+        doc.add_guide(DVec3::new(-1.0, 0.0, 2.5), DVec3::new(7.0, -3.0, 0.0));
+
+        let project = doc.to_project_file();
+        let reloaded = Document::from_project_file(&project);
+
+        assert_eq!(reloaded.guides.len(), 2);
+        assert_eq!(reloaded.guides[0].a, DVec3::new(1.0, 2.0, 3.0));
+        assert_eq!(reloaded.guides[0].b, DVec3::new(4.0, 5.0, 6.0));
+        assert_eq!(reloaded.guides[1].a, DVec3::new(-1.0, 0.0, 2.5));
+        assert_eq!(reloaded.guides[1].b, DVec3::new(7.0, -3.0, 0.0));
+    }
+
+    #[test]
+    fn a_project_file_written_before_guides_existed_still_loads() {
+        // No `guides` field at all - exactly what every project.json saved
+        // before this feature existed looks like. Must go through serde
+        // (not a struct literal, which always has the field) to actually
+        // exercise `#[serde(default)]`.
+        let project: ProjectFile =
+            serde_json::from_str(r#"{"vertices":[],"faces":[],"groups":[]}"#).unwrap();
+        assert!(project.guides.is_empty());
+        assert_eq!(Document::from_project_file(&project).guides.len(), 0);
+    }
+
+    #[test]
+    fn guides_are_not_moved_by_geometry_transforms() {
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(2.0, 2.0), None)[0];
+        doc.add_guide(DVec3::new(0.0, 0.0, 0.0), DVec3::new(1.0, 1.0, 0.0));
+
+        doc.translate_faces(&[face_id], DVec3::new(0.0, 0.0, 10.0));
+
+        assert_eq!(doc.guides.len(), 1);
+        assert_eq!(doc.guides[0].a, DVec3::new(0.0, 0.0, 0.0));
+        assert_eq!(doc.guides[0].b, DVec3::new(1.0, 1.0, 0.0));
     }
 
     /// Draws a `size` x `size` box on the plane z = `z0` and pushes/pulls it

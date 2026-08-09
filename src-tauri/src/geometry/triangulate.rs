@@ -90,6 +90,23 @@ fn ear_clip(mut poly: Vec<(VertexId, DVec2)>) -> Vec<[VertexId; 3]> {
                 continue;
             }
 
+            // An ear's new diagonal (prev-next) becomes a real triangle edge.
+            // If another vertex sits exactly on that segment - e.g. a
+            // T-junction point splitting an existing boundary edge into two
+            // exactly-collinear ones (see `face_detect::split_edges_at_interior_points`)
+            // - clipping this ear draws a straight edge that skips over it
+            // instead of passing through it, silently producing a triangle
+            // edge with no matching pair anywhere in the real boundary (a
+            // phantom open edge `check_manifold` then reports). Strict
+            // interior containment above doesn't catch this: the point is
+            // ON the new edge, not inside the triangle.
+            let skips_a_collinear_point = poly.iter().enumerate().any(|(j, &(_, p))| {
+                j != (i + n - 1) % n && j != i && j != (i + 1) % n && on_segment_interior(p, prev.1, next.1)
+            });
+            if skips_a_collinear_point {
+                continue;
+            }
+
             push_triangle_if_nondegenerate(&mut triangles, prev, curr, next);
             poly.remove(i);
             clipped_an_ear = true;
@@ -145,6 +162,25 @@ fn point_in_triangle(p: DVec2, a: DVec2, b: DVec2, c: DVec2) -> bool {
     d1 > 1e-12 && d2 > 1e-12 && d3 > 1e-12
 }
 
+/// True if `p` lies strictly between `a` and `b` on the segment they define
+/// (excluding the endpoints themselves - a match there would just be the
+/// shared vertex every adjacent ear naturally touches). Matches
+/// `Mesh::WELD_TOLERANCE`'s magnitude: this only needs to catch points that
+/// are the *same* position up to float noise, not ones merely nearby.
+fn on_segment_interior(p: DVec2, a: DVec2, b: DVec2) -> bool {
+    let ab = b - a;
+    let len_sq = ab.length_squared();
+    if len_sq < 1e-18 {
+        return false;
+    }
+    let t = (p - a).dot(ab) / len_sq;
+    if !(1e-9..=1.0 - 1e-9).contains(&t) {
+        return false;
+    }
+    let closest = a + ab * t;
+    (p - closest).length_squared() < Mesh::WELD_TOLERANCE * Mesh::WELD_TOLERANCE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +196,67 @@ mod tests {
         let face_id = mesh.add_face(vec![a, b, c, d], vec![]);
         let tris = triangulate_face(&mesh, &mesh.faces[face_id]);
         assert_eq!(tris.len(), 2);
+    }
+
+    /// Sum of the signed areas of `tris`, projected on the XY plane.
+    fn triangulated_area(mesh: &Mesh, tris: &[[VertexId; 3]]) -> f64 {
+        tris.iter()
+            .map(|tri| {
+                let p: Vec<DVec2> =
+                    tri.iter().map(|&v| mesh.position(v)).map(|q| DVec2::new(q.x, q.y)).collect();
+                cross2(p[1] - p[0], p[2] - p[0]) / 2.0
+            })
+            .sum()
+    }
+
+    #[test]
+    fn a_collinear_t_junction_vertex_is_never_skipped_by_a_triangle_edge() {
+        // The wall left behind by the corner-stud workflow: a rectangular
+        // face carrying an extra vertex partway along one edge, inserted by
+        // `face_detect::split_edges_at_interior_points` where a neighboring
+        // face was split (and mirrored onto this one by
+        // `Document::propagate_boundary_split_to_solid_siblings`), leaving
+        // three exactly-collinear consecutive boundary vertices.
+        //
+        // Asserting on AREA would not catch the bug this guards: clipping
+        // the ear at (5,0) draws the diagonal (0,0)->(10,0) straight past
+        // it, and the triangle it skips over is degenerate, so it is dropped
+        // and the total area still comes out right. The damage is only
+        // visible in the EDGES - that diagonal replaces two real boundary
+        // edges with one phantom edge that pairs with nothing on the
+        // neighboring face, which `check_manifold` reports as an open edge.
+        // Vertex order matters, and matches the real wall: the split edge is
+        // the one *away* from the ring's starting vertex. With the collinear
+        // triple adjacent to the start instead, ear-clipping happens to
+        // consume the ears in an order that never proposes the bad diagonal,
+        // and the bug hides.
+        let mut mesh = Mesh::new();
+        let v = |mesh: &mut Mesh, x: f64, y: f64| mesh.add_vertex(DVec3::new(x, y, 0.0));
+        let outer = vec![
+            v(&mut mesh, 0.0, 0.0),
+            v(&mut mesh, 10.0, 0.0),
+            v(&mut mesh, 10.0, 3.0),
+            v(&mut mesh, 5.0, 3.0), // collinear with its two neighbors
+            v(&mut mesh, 0.0, 3.0),
+        ];
+        let face_id = mesh.add_face(outer.clone(), vec![]);
+
+        let tris = triangulate_face(&mesh, &mesh.faces[face_id]);
+
+        let area = triangulated_area(&mesh, &tris);
+        assert!((area - 30.0).abs() < 1e-9, "triangulation must cover the face exactly once: got {area}");
+
+        let directed: Vec<(VertexId, VertexId)> =
+            tris.iter().flat_map(|t| [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])]).collect();
+        for i in 0..outer.len() {
+            let edge = (outer[i], outer[(i + 1) % outer.len()]);
+            let count = directed.iter().filter(|&&e| e == edge).count();
+            assert_eq!(
+                count, 1,
+                "every real boundary edge must appear in exactly one triangle, in the boundary's own \
+                 direction; edge {i} appeared {count} times"
+            );
+        }
     }
 
     #[test]

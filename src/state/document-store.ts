@@ -28,11 +28,19 @@ export interface GroupSnapshot {
   name: string;
 }
 
+/// A Measure-tool guide segment - see the Rust `Guide`. Its endpoints,
+/// midpoint, and any point along it are snap targets for the draw tools.
+export interface Guide {
+  a: [number, number, number];
+  b: [number, number, number];
+}
+
 export interface DocumentSnapshot {
   vertices: [number, number, number][];
   faces: FaceSnapshot[];
   groups: GroupSnapshot[];
   selected_face_ids: FaceId[];
+  guides: Guide[];
 }
 
 /// One offending edge from `checkModel`, in world coordinates rather than as
@@ -68,7 +76,7 @@ type Vec2 = [number, number];
 type Listener = (snapshot: DocumentSnapshot) => void;
 type ReportListener = (report: ModelReport | null) => void;
 
-const EMPTY_SNAPSHOT: DocumentSnapshot = { vertices: [], faces: [], groups: [], selected_face_ids: [] };
+const EMPTY_SNAPSHOT: DocumentSnapshot = { vertices: [], faces: [], groups: [], selected_face_ids: [], guides: [] };
 
 class DocumentStore {
   private snapshot: DocumentSnapshot = EMPTY_SNAPSHOT;
@@ -380,6 +388,18 @@ class DocumentStore {
   selectFaces(faceIds: FaceId[]) {
     return this.enqueue(async () => {
       this.apply(await invoke<DocumentSnapshot>("select_faces", { faceIds }));
+    });
+  }
+
+  addGuide(a: Vec3, b: Vec3) {
+    return this.enqueue(async () => {
+      this.applyEdit(await invoke<DocumentSnapshot>("add_guide", { a, b }));
+    });
+  }
+
+  clearGuides() {
+    return this.enqueue(async () => {
+      this.applyEdit(await invoke<DocumentSnapshot>("clear_guides"));
     });
   }
 

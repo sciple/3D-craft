@@ -28,8 +28,72 @@ pub struct DetectedFace {
 /// them by point-in-polygon containment: a candidate immediately inside
 /// another becomes both its own face and a hole of the containing one.
 pub fn detect_faces(points: &[DVec2], edges: &[(usize, usize)]) -> Vec<DetectedFace> {
-    let loops = trace_ccw_loops(points, edges);
+    let edges = split_edges_at_interior_points(points, edges);
+    let loops = trace_ccw_loops(points, &edges);
     build_face_forest(points, &loops)
+}
+
+/// Splits any edge that another point lands on partway along its length (a
+/// T-junction) into two edges meeting at that point. Without this, a new
+/// shape sharing part of an edge with the face it's drawn on - most
+/// basically, a rectangle sketched in the corner of a larger rectangular
+/// face, the "stud built into the corner of a box's top face" workflow -
+/// leaves the existing long edge and the new short edge exactly collinear
+/// and overlapping for part of their length: `trace_ccw_loops`'s
+/// neighbor-angle sort sees two outgoing edges from the shared vertex
+/// pointing in the exact same direction with no tiebreaker between them, and
+/// even with one, the graph has no representation for "this edge continues
+/// past the new point" without an actual vertex there. Matches SketchUp's
+/// own "sticky geometry": drawing a line that touches an existing edge
+/// splits that edge at the touch point.
+fn split_edges_at_interior_points(points: &[DVec2], edges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    // Any point genuinely closer than this to an edge's own endpoint would
+    // already have been merged into that endpoint's vertex by the caller's
+    // own position weld (see `Mesh::WELD_TOLERANCE`, the same magnitude),
+    // so only points meaningfully into an edge's interior reach this check.
+    const ON_SEGMENT_TOLERANCE: f64 = 1e-3;
+
+    let mut result = Vec::with_capacity(edges.len());
+    for &(a, b) in edges {
+        if a == b {
+            continue;
+        }
+        let pa = points[a];
+        let pb = points[b];
+        let ab = pb - pa;
+        let len_sq = ab.length_squared();
+
+        let mut interior: Vec<(usize, f64)> = if len_sq > 1e-18 {
+            points
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != a && i != b)
+                .filter_map(|(i, &p)| {
+                    let t = (p - pa).dot(ab) / len_sq;
+                    if !(1e-9..=1.0 - 1e-9).contains(&t) {
+                        return None;
+                    }
+                    let closest = pa + ab * t;
+                    ((p - closest).length_squared() < ON_SEGMENT_TOLERANCE * ON_SEGMENT_TOLERANCE).then_some((i, t))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        if interior.is_empty() {
+            result.push((a, b));
+            continue;
+        }
+        interior.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap());
+        let mut prev = a;
+        for (idx, _) in interior {
+            result.push((prev, idx));
+            prev = idx;
+        }
+        result.push((prev, b));
+    }
+    result
 }
 
 fn trace_ccw_loops(points: &[DVec2], edges: &[(usize, usize)]) -> Vec<LoopIndices> {
@@ -142,7 +206,76 @@ fn build_face_forest(points: &[DVec2], loops: &[LoopIndices]) -> Vec<DetectedFac
             faces[*p].holes.push(hole);
         }
     }
+    for face in &mut faces {
+        face.holes = merge_holes_sharing_an_edge(std::mem::take(&mut face.holes));
+    }
     faces
+}
+
+/// Fuses any two of a face's hole loops that run along a shared edge into
+/// the single loop tracing the outside of their union.
+///
+/// Two *regions* adjacent along an edge are correctly traced as two separate
+/// cycles - they really are two regions, and each may independently become
+/// its own face or stay empty. But as *holes of the face around them* they
+/// describe one connected area the face doesn't cover, and describing it with
+/// two loops is wrong data, not merely an unusual encoding: `triangulate_face`
+/// bridges each hole to the nearest polygon vertex, so the second bridge
+/// lands on a vertex the first hole already contributed (distance zero),
+/// producing a self-touching polygon that ear-clipping cannot resolve. It
+/// bails out with a partial triangulation, whose edges then fail to
+/// reconstruct the real boundary - reported downstream as open edges by
+/// `check_manifold`, and rendered/exported with a chunk of the face missing.
+/// `pushpull` would likewise raise one wall per loop and duplicate the shared
+/// edge, so this is fixed here, once, rather than in each consumer.
+///
+/// Reachable as soon as a sketch can be drawn flush against an existing
+/// stud's rim (see `split_edges_at_interior_points`, which is what lets that
+/// alignment survive face detection at all).
+///
+/// Deliberately handles only edge-sharing, not loops meeting at a single
+/// vertex: those pinch to a figure-eight that no single simple loop
+/// represents, and no draw tool here produces them without also sharing an
+/// edge.
+fn merge_holes_sharing_an_edge(mut holes: Vec<LoopIndices>) -> Vec<LoopIndices> {
+    'restart: loop {
+        for x in 0..holes.len() {
+            for y in (x + 1)..holes.len() {
+                let Some(merged) = merge_two_loops_on_shared_edge(&holes[x], &holes[y]) else {
+                    continue;
+                };
+                holes.remove(y); // y > x, so removing it first keeps x valid.
+                holes[x] = merged;
+                continue 'restart;
+            }
+        }
+        return holes;
+    }
+}
+
+/// Joins `first` and `second` along the first directed edge they share in
+/// opposite directions (`first` traverses `a -> b`, `second` traverses
+/// `b -> a`), dropping that now-interior edge. Returns `None` when they share
+/// no such edge. Both loops are wound the same way, so the result is too.
+fn merge_two_loops_on_shared_edge(first: &[usize], second: &[usize]) -> Option<LoopIndices> {
+    let (n, m) = (first.len(), second.len());
+    for i in 0..n {
+        let (a, b) = (first[i], first[(i + 1) % n]);
+        for j in 0..m {
+            if second[j] != b || second[(j + 1) % m] != a {
+                continue;
+            }
+            // Walk `first` up to `a`, detour the whole of `second` the long
+            // way round from `a` back to `b` (i.e. every vertex except the
+            // two ends of the shared edge), then resume `first` at `b`.
+            let mut merged = Vec::with_capacity(n + m - 2);
+            merged.extend(first[..=i].iter().copied());
+            merged.extend((2..m).map(|k| second[(j + k) % m]));
+            merged.extend(first[i + 1..].iter().copied());
+            return Some(merged);
+        }
+    }
+    None
 }
 
 fn angle_at(points: &[DVec2], from: usize, to: usize) -> f64 {
@@ -184,6 +317,42 @@ fn point_in_polygon(p: DVec2, points: &[DVec2], loop_indices: &[usize]) -> bool 
         j = i;
     }
     inside
+}
+
+/// Distance-tolerant point-in-polygon test: true if `p` is inside `polygon`
+/// or within `tolerance` of its boundary. Used to validate that a
+/// freshly-drawn loop actually belongs to the face it's about to be
+/// resplit against - see `Document::resplit_face_with_loops`, which rejects
+/// a loop that fails this rather than handing `detect_faces` a loop whose
+/// edges cross the target face's own boundary instead of merely touching it
+/// at shared vertices (something the half-edge tracing above has no
+/// representation for, and silently corrupts on).
+pub(crate) fn point_in_or_near_polygon(p: DVec2, polygon: &[DVec2], tolerance: f64) -> bool {
+    let n = polygon.len();
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let pi = polygon[i];
+        let pj = polygon[j];
+        if ((pi.y > p.y) != (pj.y > p.y)) && (p.x < (pj.x - pi.x) * (p.y - pi.y) / (pj.y - pi.y) + pi.x) {
+            inside = !inside;
+        }
+        j = i;
+    }
+    if inside {
+        return true;
+    }
+    (0..n).any(|i| distance_to_segment(p, polygon[i], polygon[(i + 1) % n]) < tolerance)
+}
+
+fn distance_to_segment(p: DVec2, a: DVec2, b: DVec2) -> f64 {
+    let ab = b - a;
+    let len_sq = ab.length_squared();
+    if len_sq < 1e-18 {
+        return (p - a).length();
+    }
+    let t = ((p - a).dot(ab) / len_sq).clamp(0.0, 1.0);
+    (p - (a + ab * t)).length()
 }
 
 #[cfg(test)]
@@ -250,6 +419,113 @@ mod tests {
         let hole_area = polygon_area(&points, &outer_face.holes[0]);
         assert!(outer_area > 0.0, "outer loop must be CCW (positive area)");
         assert!(hole_area < 0.0, "hole loop must be CW (negative area) - opposite the outer loop");
+    }
+
+    #[test]
+    fn a_rectangle_sharing_a_corner_with_a_larger_one_splits_it_without_a_tie() {
+        // The corner-stud workflow: a smaller rectangle drawn flush into the
+        // corner of a larger one. Point 4 lands partway along edge 0-1 and
+        // point 6 lands partway along edge 3-0 - both T-junctions - so
+        // without `split_edges_at_interior_points`, vertex 0 would have two
+        // pairs of exactly-collinear outgoing edges (to 1 and 4, to 3 and 6)
+        // that the neighbor-angle sort has no tiebreaker for.
+        let points = vec![
+            DVec2::new(0.0, 0.0),   // 0: shared corner
+            DVec2::new(10.0, 0.0),  // 1
+            DVec2::new(10.0, 10.0), // 2
+            DVec2::new(0.0, 10.0),  // 3
+            DVec2::new(5.0, 0.0),   // 4: on segment 0-1
+            DVec2::new(5.0, 5.0),   // 5
+            DVec2::new(0.0, 5.0),   // 6: on segment 3-0
+        ];
+        let mut edges = loop_edges(&[0, 1, 2, 3]);
+        edges.extend(loop_edges(&[0, 4, 5, 6]));
+
+        let faces = detect_faces(&points, &edges);
+
+        assert_eq!(faces.len(), 2, "the corner-stud footprint and the remaining L-shaped area");
+        assert!(faces.iter().all(|f| f.holes.is_empty()), "a corner-shared split must not nest as a hole");
+
+        let inner = faces.iter().find(|f| f.outer.contains(&4)).unwrap();
+        assert!((polygon_area(&points, &inner.outer).abs() - 25.0).abs() < 1e-9);
+
+        let outer = faces.iter().find(|f| f.outer.contains(&2)).unwrap();
+        assert!((polygon_area(&points, &outer.outer).abs() - 75.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_point_partway_along_an_edge_splits_it_even_with_no_shared_vertex() {
+        // A slot notch: both of the new loop's touching points land strictly
+        // inside an existing edge's interior, with no shared vertex at all.
+        let points = vec![
+            DVec2::new(0.0, 0.0),  // 0
+            DVec2::new(10.0, 0.0), // 1
+            DVec2::new(10.0, 5.0), // 2
+            DVec2::new(0.0, 5.0),  // 3
+            DVec2::new(3.0, 0.0),  // 4: on segment 0-1
+            DVec2::new(7.0, 0.0),  // 5: on segment 0-1
+            DVec2::new(7.0, 2.0),  // 6
+            DVec2::new(3.0, 2.0),  // 7
+        ];
+        let mut edges = loop_edges(&[0, 1, 2, 3]);
+        edges.extend(loop_edges(&[4, 5, 6, 7]));
+
+        let faces = detect_faces(&points, &edges);
+
+        assert_eq!(faces.len(), 2);
+        assert!(faces.iter().all(|f| f.holes.is_empty()));
+        // The outer U-shape's own trace hugs three of the notch's four
+        // walls (it detours up and around rather than passing straight
+        // through), so every one of the notch's vertices - including 6 and
+        // 7 - is also referenced by the outer loop; only the notch's own
+        // loop length (4 vs. 8) tells them apart.
+        let notch = faces.iter().find(|f| f.outer.len() == 4).unwrap();
+        assert!((polygon_area(&points, &notch.outer).abs() - 8.0).abs() < 1e-9);
+        let outer = faces.iter().find(|f| f.outer.len() == 8).unwrap();
+        assert!((polygon_area(&points, &outer.outer).abs() - 42.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn two_adjacent_inner_regions_become_one_merged_hole_not_two() {
+        // Two rectangles sharing a full edge, both sitting inside a larger
+        // square. Each is legitimately its own region (and its own face),
+        // but as holes of the square around them they describe a single
+        // connected uncovered area - and must be reported as one loop.
+        // Two separate loops sharing an edge is data `triangulate_face`'s
+        // hole-bridging cannot represent: the second bridge lands on a
+        // vertex the first hole already contributed, ear-clipping bails out,
+        // and the face comes back partially triangulated (open edges
+        // downstream, a visible chunk missing when rendered/exported).
+        let points = vec![
+            DVec2::new(0.0, 0.0),   // 0  outer
+            DVec2::new(20.0, 0.0),  // 1
+            DVec2::new(20.0, 20.0), // 2
+            DVec2::new(0.0, 20.0),  // 3
+            DVec2::new(5.0, 5.0),   // 4  left rectangle
+            DVec2::new(10.0, 5.0),  // 5  shared edge, low
+            DVec2::new(10.0, 15.0), // 6  shared edge, high
+            DVec2::new(5.0, 15.0),  // 7
+            DVec2::new(15.0, 5.0),  // 8  right rectangle
+            DVec2::new(15.0, 15.0), // 9
+        ];
+        let mut edges = loop_edges(&[0, 1, 2, 3]);
+        edges.extend(loop_edges(&[4, 5, 6, 7]));
+        edges.extend(loop_edges(&[5, 8, 9, 6]));
+
+        let faces = detect_faces(&points, &edges);
+
+        assert_eq!(faces.len(), 3, "both inner rectangles plus the square around them");
+        let outer_face = faces.iter().find(|f| f.outer.contains(&0)).unwrap();
+        assert_eq!(outer_face.holes.len(), 1, "the two adjacent regions must fuse into a single hole loop");
+        let hole_area = polygon_area(&points, &outer_face.holes[0]).abs();
+        assert!(
+            (hole_area - 100.0).abs() < 1e-9,
+            "the merged hole must trace the union of both rectangles (10x10), got {hole_area}"
+        );
+        assert!(hole_area > 0.0);
+        // The shared edge's endpoints survive as collinear vertices on the
+        // union's boundary, so the merged loop is a hexagon, not a quad.
+        assert_eq!(outer_face.holes[0].len(), 6);
     }
 
     #[test]

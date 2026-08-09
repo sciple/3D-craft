@@ -34,6 +34,8 @@ pub fn run() {
             commands::ungroup,
             commands::select_group,
             commands::select_faces,
+            commands::add_guide,
+            commands::clear_guides,
             commands::save_project,
             commands::load_project,
             commands::export_stl,

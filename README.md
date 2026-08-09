@@ -61,17 +61,24 @@ to set an exact value (mm, or degrees for Rotate) and press **Enter** to commit;
 | Scale | `G` | Scale the selection about its center. |
 | Move | `M` | Drag to reposition. Hold `Shift` for vertical; press `X`/`Y`/`Z` to lock to an axis. |
 | Rotate | `T` | Drag to rotate. Press `X`/`Y`/`Z` to choose the spin axis (defaults to Z). |
-| Measure | `E` | Click two points to read the straight-line distance plus X/Y/Z deltas. Snaps to corners/midpoints/edges, or free points on faces/ground; `Esc` cancels. Creates no geometry. |
+| Measure | `E` | Click two points to read the straight-line distance plus X/Y/Z deltas. Snaps to corners/midpoints/edges/guides, or free points on faces/ground; `Esc` cancels the current measurement. Creates no geometry, but leaves a **guide** — a dashed magenta line with marks at both ends and the midpoint — that other tools can then snap to (see below). Each measurement is one `Ctrl+Z` step. |
 
 Other controls:
 
 - **Camera**: orbit, pan, and zoom with the mouse (SketchUp-style), Z-up.
 - **Build plate**: the ground grid is a true-scale 180 × 180 mm print bed in 10 mm cells, centered
   on the origin; the brighter outline marks the printable boundary.
+- **Guides**: taking a measurement (see the Measure tool above) leaves a persistent mark other tools
+  snap to — endpoints, midpoint, or anywhere along the measured segment — so a rectangle's corner or
+  a circle's center can land exactly on a distance you just measured. Guides are saved with the
+  project and survive undo/redo like any other edit, but they **don't move** when you move, rotate,
+  or scale geometry — re-measure after repositioning a part. Clear them from the outliner's
+  **Clear Guides** button.
 - **Undo / Redo**: `Ctrl+Z` / `Ctrl+Y` (or `Ctrl+Shift+Z`).
-- **Outliner** (right panel): manage groups, mirror a copy of the selection across X/Y/Z, and
+- **Outliner** (right panel): manage groups, mirror a copy of the selection across X/Y/Z,
   **Drop to Plate** — moves every selected object independently down (or up) along Z so each one
-  rests on the build plate.
+  rests on the build plate — and **Clear Guides** — removes every mark left by the Measure tool in
+  one undo step (shows the current count, e.g. `Clear Guides (3)`).
   - **Array** — copies the selection into a grid: set **Cols** (across X) and **Rows** (along Y),
     plus the **Pitch** X/Y spacing in mm, then click **Array**. The counts *include* the original,
     so `3 × 2` gives six objects in total, and the pitch is **center-to-center** (a pitch smaller

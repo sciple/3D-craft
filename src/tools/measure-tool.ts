@@ -3,17 +3,23 @@ import type { Tool, ToolContext } from "./types";
 import { PreviewLine } from "./preview-line";
 import { SnapIndicator, raycastSnapped3d } from "./snapping";
 import { measurementHud } from "../ui/measurement-hud";
+import { documentStore } from "../state/document-store";
 
 /// A tape measure: click two points to read the straight-line distance between
-/// them (plus the X/Y/Z component deltas), SketchUp-style. It's a pure
-/// reference tool - it never creates or mutates geometry, so it issues no
-/// backend commands at all; the segment and readout are client-side overlays.
+/// them (plus the X/Y/Z component deltas), SketchUp-style. It creates no
+/// document geometry, but the finished segment is recorded as a persistent
+/// guide (`documentStore.addGuide`) - undoable, saved with the project, and
+/// drawn/snapped-to by `GuideRenderer`/`snapping.ts` so a later shape can be
+/// built exactly on a distance you just measured.
 ///
-/// Points snap to model vertices/midpoints/edges (via `raycastSnapped3d`) and
-/// otherwise fall on the hovered surface or the ground plane, so you can
-/// measure between exact corners or to a free point. First click sets the
-/// start; second click finalizes and leaves the segment + readout on screen;
-/// the next click starts a fresh measurement. Esc cancels an in-progress one.
+/// Points snap to model vertices/midpoints/edges - and existing guides - via
+/// `raycastSnapped3d`, and otherwise fall on the hovered surface or the
+/// ground plane, so you can measure between exact corners or to a free
+/// point. First click sets the start; second click finalizes, commits the
+/// guide, and leaves the readout on screen; the next click starts a fresh
+/// measurement. Esc cancels only an in-progress measurement - it never
+/// touches guides already committed; use Clear Guides (in the outliner) for
+/// that.
 export class MeasureTool implements Tool {
   readonly name = "measure";
   private raycaster = new THREE.Raycaster();
@@ -39,20 +45,30 @@ export class MeasureTool implements Tool {
     const pick = raycastSnapped3d(e, ctx, this.raycaster);
     if (!pick) return;
     if (!this.first) {
-      // Start a fresh measurement, clearing any previous persisted segment.
-      this.line.clear(ctx.scene);
       this.first = pick.point.clone();
       this.showReadout(this.first, this.first);
     } else {
-      // Second click finalizes: keep the segment + readout on screen, and arm
-      // for a new measurement on the next click.
-      this.line.update(ctx.scene, [this.first, pick.point]);
-      this.showReadout(this.first, pick.point);
+      const start = this.first;
+      const end = pick.point.clone();
+      this.showReadout(start, end);
+      // Reset synchronously, before the (queued, async) invoke: a second
+      // click landing while the round trip is still pending must already
+      // see a clean state, ready to start the next measurement.
       this.first = null;
+      // The finished segment becomes a persistent guide, drawn by
+      // GuideRenderer off the next snapshot - drop the transient preview so
+      // the segment isn't rendered twice (once solid amber, once dashed).
+      this.line.clear(ctx.scene);
+      if (start.distanceTo(end) > 1e-6) {
+        void documentStore.addGuide([start.x, start.y, start.z], [end.x, end.y, end.z]);
+      }
     }
   }
 
   onKeyDown(e: KeyboardEvent, ctx: ToolContext) {
+    // Cancels only the in-progress measurement (the not-yet-clicked second
+    // point). Committed guides are undoable/persistent document state now -
+    // only Clear Guides (outliner) removes them, never Esc.
     if (e.key === "Escape") this.reset(ctx);
   }
 

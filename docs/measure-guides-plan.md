@@ -490,3 +490,127 @@ Manual, in `npm run tauri dev` — this is the acceptance walkthrough:
 Steps 9-11 are the regression checks that matter most — they cover the pre-existing behaviour this
 feature reaches into. Only once all of the above passes on `measure-guides` does the branch fold back
 into `main`.
+
+## Post-implementation: a real bug found during manual verification
+
+Manual testing surfaced actual model corruption ("faces disappear") when drawing a new shape whose
+corner snaps onto a guide endpoint that coincides with an existing model vertex shared by multiple
+faces (e.g. a box corner). Root-caused via GUI reproduction with and without guides involved — this
+turned out to be a **pre-existing bug in `resplit_face_with_loops`/`resplit_plane`/`resplit_loops`**,
+not something specific to guides; guides simply make it far easier to trigger, since the snap indicator
+actively invites clicking exactly on a point like that.
+
+Two distinct failure modes were found and fixed (see the new CLAUDE.md bullet for
+`resplit_loops`/`resplit_face_with_loops`/`resplit_plane` for the full explanation):
+
+1. **Ambiguous face resolution at a shared vertex** — the frontend's `resolveSketchTarget` locks the
+   sketch plane from a single raycast, which can resolve to *either* of two faces meeting at a corner.
+   When it picks the "wrong" one, the rest of the shape — sized from screen positions the user meant
+   for a different plane — ends up with edges crossing the (wrong) target face's boundary, which
+   `face_detect`'s planar graph has no way to represent. Fixed with a face-fit check in
+   `resplit_face_with_loops` that rejects a loop not contained in (or touching the edge of) the target
+   face, rather than feeding `face_detect` garbage.
+2. **`face_detect` returns nothing for degenerate topologies** — e.g. two axis-aligned rectangles
+   sharing one corner tie every neighbor-angle comparison there, so `detect_faces` comes back with zero
+   loops. Both `resplit_face_with_loops` and `resplit_plane` used to erase the source face(s) *before*
+   calling `resplit_loops`, so a zero-loop result deleted real geometry with nothing to replace it.
+   Fixed by reordering: erase only after confirming the replacement is non-empty.
+
+A third, smaller hardening was added alongside these: `resplit_loops` now welds vertices within
+`Mesh::WELD_TOLERANCE` (1e-3mm) of each other into the same 2D point before running `face_detect`, since
+a freshly-drawn corner snapped onto an existing vertex is a *new* `VertexId` that round-tripped through
+the f32 `DocumentSnapshot` and is a hair off the original's exact f64 position — without the weld,
+near-duplicate points produce essentially arbitrary neighbor-angle ordering.
+
+Six new Rust tests cover this (`document.rs`): the new ones are
+`drawing_on_a_face_with_a_corner_nearly_matching_an_existing_vertex_does_not_corrupt_the_face`,
+`resplitting_a_face_with_a_loop_that_lands_on_the_wrong_neighboring_face_is_rejected`,
+`a_rectangle_sharing_a_corner_with_its_target_face_is_a_safe_no_op_not_a_lost_face`, and
+`studs_on_two_adjacent_faces_snapped_to_the_same_corner_stay_watertight`. All 96 backend tests pass;
+verified live in the GUI (with careful re-focus verification between automation steps, after discovering
+this VS Code window itself could steal focus mid-script) that the original corruption is gone and the
+model stays watertight (Check Model) after exercising the fixed corner-snap path.
+
+### Follow-up: a second report ("often not STL-compliant") and what was and wasn't reproduced
+
+After the above fixes, the user reported a second screenshot showing red "open edge" lines (Check
+Model's problem-edge overlay) through a multi-level "staircase" structure built with guides. Investigation:
+
+- Confirmed `resplit_face_with_loops` only welds a new loop against its *own* target face's boundary
+  within one call — sketching on face A, snapping onto a vertex, then *separately* sketching on adjacent
+  face B and snapping onto that same vertex is two independent calls, so the within-one-call weld alone
+  can't connect them. Fixed with `connected_component_vertices` + `weld_loop_onto`, scoping the weld to
+  the whole connected solid (see the CLAUDE.md bullet). First attempt at this fix welded at raw
+  vertex-creation time instead (mesh-wide) and broke `arrange_for_print_has_no_pairwise_overlap_across_varied_part_sizes`
+  by merging unrelated objects that happened to share a coordinate — reverted in favor of the
+  connected-solid-scoped version.
+- Tried multiple realistic guide-driven multi-step GUI reproductions afterward (single-face corner
+  touch, cross-face corner touch, and a genuine multi-level staircase referencing freshly-created
+  geometry from a previous step, not just the original box) — all came back watertight (Check Model)
+  with the connected-solid weld in place. Could not reproduce the specific screenshot's corruption after
+  this fix.
+- Notable loose end: earlier in the same session, the VS Code window hosting this conversation was
+  observed running `npm run tauri build` (a release build) in its own terminal, separate from the
+  `npm run tauri dev` instance being tested against. If the user's second screenshot was taken against
+  that release build rather than a freshly rebuilt dev instance, it would predate this fix. Flagged to
+  the user as the most likely explanation if they can't reproduce it again on a fresh build — otherwise,
+  the exact shape/step sequence that produced it is needed to reproduce it precisely, since guessing via
+  screen-coordinate GUI automation has diminishing returns.
+
+### Second follow-up: "a rectangle aligned to the edges of a rectangular face" regressed
+
+The user reported that building a rectangle aligned to the edges of a rectangular face either produces
+an invalid model or is refused outright, after the fixes above. Root cause: `a_rectangle_sharing_a_corner_with_its_target_face_is_a_safe_no_op_not_a_lost_face`,
+a test written *during* the first follow-up, had quietly turned a genuine, extremely common operation —
+sketching a rectangle whose corner lands exactly on an existing corner of the face it's drawn on (the
+everyday "stud in the corner of a box top" move) — into a guaranteed no-op rejection, and documented that
+as correct behavior. It isn't: two axis-aligned rectangles sharing a corner always produce two pairs of
+exactly-collinear edges there, which `face_detect::trace_ccw_loops`'s neighbor-angle sort has no
+tiebreaker for, and the erase-after-validate fix from the first follow-up made that tie fail *safely*
+(reject, don't corrupt) rather than fail *correctly* (still produce the split the user asked for). A safe
+no-op is still wrong when the input was valid.
+
+Three changes were needed, found by working outward from the flat 2D case to an actual pushed 3D stud,
+each step surfacing a bug the previous one didn't:
+
+1. **`face_detect::split_edges_at_interior_points`** (new): before `trace_ccw_loops` builds its
+   neighbor-angle graph, splits any edge at every other point that lands on its *interior* (a
+   T-junction) — turning one long edge plus one exactly-collinear short edge into two/three edges that
+   share a vertex instead of merely overlapping. This alone fixes the flat 2D case and is what
+   `a_rectangle_sharing_a_corner_with_a_larger_one_splits_it_without_a_tie` (`face_detect.rs`) and the
+   rewritten `a_rectangle_sharing_a_corner_with_its_target_face_splits_it_correctly` (`document.rs`)
+   check.
+2. **`Document::propagate_boundary_split_to_solid_siblings`** (new): splitting `face_id`'s own boundary
+   edge at a T-junction doesn't touch any *other* face — this mesh's faces don't share topology (see
+   `Mesh`'s struct doc comment), each owns an independent vertex-id loop. If `face_id` is already on a
+   solid's boundary (e.g. it's a box's top cap), the wall below it still has the old, unsplit edge, and
+   now has no matching reverse-direction edge anywhere — an open edge, invisible in the flat 2D case
+   because there's no adjacent wall to desync from. Found by extending the corner-stud test to actually
+   push/pull the sketch into a real stud (`pushing_a_corner_stud_sketch_into_a_real_stud_stays_watertight`)
+   and checking `check_model`, not just asserting the flat split's face count. Fixed by finding every
+   sibling face in the same connected component that shares the split edge (opposite winding direction,
+   per this app's CCW-outward convention) and splicing the same new vertex into its own loop at the
+   matching position — explicitly excluding both `face_id` itself (about to be erased) and the
+   just-created replacement faces (already built from the post-split graph; re-matching against them
+   would insert a duplicate vertex into an already-correct boundary).
+3. **`triangulate.rs`'s `on_segment_interior`** (new): even with (1) and (2) both correct — verified by
+   dumping the exact post-fix mesh state and hand-checking every directed edge pairs — `check_model`
+   *still* reported open edges. Root cause was a third, unrelated bug: a wall's boundary after (2) is a
+   pentagon with three *exactly collinear* consecutive vertices (the T-junction point sitting between
+   its two neighbors), and `triangulate.rs`'s ear-clipping used a strict, non-boundary-inclusive
+   `point_in_triangle` test to decide whether an ear was safe to clip. A point sitting exactly *on* an
+   ear's new diagonal isn't strictly *inside* the ear triangle, so the strict test let the clipper cut a
+   diagonal straight past the collinear point instead of being blocked by it — producing a triangle edge
+   that doesn't correspond to any real boundary edge, which `check_manifold` correctly reports as open
+   even though the polygon's own boundary loop is completely correct. `point_in_triangle` itself
+   deliberately stays strict (hole-bridging's duplicate vertices sit exactly on the boundary by
+   construction, and a boundary-inclusive test there would block every ear near a bridge) — the fix is a
+   second, narrower check specific to the ear's *new* (prev, next) edge only.
+
+All three were necessary; each one's absence produces a different symptom (rejected draw / open edge on
+the flat cap / open edge on the wall despite correct topology), which is why the original single-file fix
+looked complete (98 tests green) until tested against an actual pushed stud, not just a flat corner
+split. Verification: `cargo test` (101 tests, all passing, including the two new ones above plus
+`a_point_partway_along_an_edge_splits_it_even_with_no_shared_vertex` for the no-shared-vertex T-junction
+case) and `npx tsc --noEmit` clean. Not yet re-verified against a live GUI rebuild in this pass — see the
+chat for the plan to do so before folding back to `main`.
