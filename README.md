@@ -56,6 +56,7 @@ to set an exact value (mm, or degrees for Rotate) and press **Enter** to commit;
 | Arc | `A` | Click center, click to set radius, click (or type degrees) to set the sweep. Closes with a straight chord - a 180° arc is a half-pipe cross-section. |
 | N-Gon | `N` | Click center, click to set radius and rotation (one vertex lands under the cursor). Press `↑`/`↓` to change the side count (5-8, default 6) before committing. |
 | Polygon | `L` | Click points to draw a closed polygon. Hold `Shift` while placing a point to lock the segment to the sketch plane's axes (90° corners). |
+| Line Segment | `K` | Click two points on an existing face to cut it into two separate faces along that line (e.g. the diagonal of a rectangle) - Push/Pull can then extrude just one half. Both points must land on the face's own boundary (its edges/corners); snaps the same way the other draw tools do. On a ring/annulus (a circle with a hole), one radial cut (outer edge to inner edge) alone doesn't split it - it takes two radial cuts to separate a wedge you can push/pull independently. |
 | Push/Pull | `P` | Drag a face along its normal to extrude a solid (or carve inward). |
 | Inset | `I` | Offset a face's border inward. |
 | Scale | `G` | Scale the selection about its center. |

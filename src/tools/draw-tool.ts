@@ -905,3 +905,143 @@ export class DrawPolygonTool implements Tool {
     measurementHud.hide();
   }
 }
+
+/// Click-click line segment ("Knife") tool: cuts an existing face into two
+/// separate faces along a straight chord - e.g. click one corner of a
+/// rectangle then the opposite corner to split it into two triangles, so
+/// Push/Pull can then extrude just one of them. Unlike every other draw tool
+/// here, the first click must land on an existing face - `target.plane.faceId`
+/// - and does NOT fall back to the ground plane: a segment with no host face
+/// has nothing to cut. The second point's math (typed-length override
+/// composed with the direction from the anchor point) mirrors
+/// `DrawPolygonTool.effectiveNextUv`, since a segment is length+direction
+/// from an anchor, not corner-to-corner box math like `DrawRectangleTool`.
+/// Both endpoints must land on the target face's own boundary (its
+/// corners/edges) to actually split it - see `Document::draw_line_segment` on
+/// the Rust side - so an off-boundary commit is a harmless no-op.
+export class DrawLineSegmentTool implements Tool {
+  readonly name = "line-segment";
+  private raycaster = new THREE.Raycaster();
+  private activePlane: SketchPlane | null = null;
+  private startUv: THREE.Vector2 | null = null;
+  private currentUv: THREE.Vector2 | null = null;
+  private numeric = new NumericBuffer();
+  private preview = new PreviewLine();
+  private snapIndicator = new SnapIndicator();
+
+  constructor(private onCommitted?: () => void) {}
+
+  activate() {
+    this.activePlane = null;
+    this.startUv = null;
+    this.currentUv = null;
+    this.numeric.clear();
+  }
+
+  deactivate(ctx: ToolContext) {
+    this.reset(ctx);
+  }
+
+  onPointerDown(e: PointerEvent, ctx: ToolContext) {
+    if (e.button !== 0) return;
+
+    if (!this.activePlane) {
+      const target = resolveSketchTarget(e, ctx, this.raycaster);
+      if (!target || !target.plane.faceId) return; // must land on an existing face - nothing to cut otherwise
+      const snap = findPlanarSnap(documentStore.getSnapshot(), target.point, target.plane, ctx.camera, ctx.domElement);
+      const point = snap ? snap.point : target.point;
+      this.activePlane = target.plane;
+      this.startUv = to2d(target.plane, point);
+      this.currentUv = this.startUv.clone();
+      return;
+    }
+
+    this.commit(ctx);
+  }
+
+  onPointerMove(e: PointerEvent, ctx: ToolContext) {
+    if (!this.activePlane) {
+      const target = resolveSketchTarget(e, ctx, this.raycaster);
+      const snap =
+        target && target.plane.faceId
+          ? findPlanarSnap(documentStore.getSnapshot(), target.point, target.plane, ctx.camera, ctx.domElement)
+          : null;
+      this.snapIndicator.update(ctx.scene, ctx.camera, snap);
+      return;
+    }
+
+    const hit = raycastPlaneSnapped(e, ctx, this.raycaster, this.activePlane);
+    if (!hit) return;
+    this.snapIndicator.update(ctx.scene, ctx.camera, hit.snap);
+    this.currentUv = to2d(this.activePlane, hit.point);
+    this.updatePreview(ctx);
+  }
+
+  onKeyDown(e: KeyboardEvent, ctx: ToolContext) {
+    if (this.activePlane && this.startUv) {
+      if (e.key === "Enter") {
+        if (!this.numeric.isEmpty) this.commit(ctx);
+        return;
+      }
+      if (e.key === "Escape" && !this.numeric.isEmpty) {
+        this.numeric.clear();
+        this.updatePreview(ctx);
+        return;
+      }
+      if (this.numeric.type(e)) {
+        this.updatePreview(ctx);
+        return;
+      }
+    }
+    if (e.key === "Escape") {
+      this.reset(ctx);
+    }
+  }
+
+  private effectiveEndUv(): THREE.Vector2 | null {
+    if (!this.startUv || !this.currentUv) return null;
+    if (this.numeric.isEmpty) return this.currentUv;
+    const dist = this.numeric.values()[0];
+    if (dist === undefined) return this.currentUv;
+    const dir = this.currentUv.clone().sub(this.startUv);
+    if (dir.lengthSq() < 1e-12) return this.currentUv;
+    dir.normalize();
+    return this.startUv.clone().addScaledVector(dir, dist);
+  }
+
+  private updatePreview(ctx: ToolContext) {
+    const plane = this.activePlane;
+    const a = this.startUv;
+    const b = this.effectiveEndUv();
+    if (!plane || !a || !b) return;
+    this.preview.update(ctx.scene, [to3d(plane, a), to3d(plane, b)]);
+    measurementHud.show("Line Segment", `${a.distanceTo(b).toFixed(1)} mm`, this.numeric.isEmpty ? null : this.numeric.display);
+  }
+
+  private commit(ctx: ToolContext) {
+    const plane = this.activePlane;
+    const a = this.startUv;
+    const b = this.effectiveEndUv();
+    const faceId = plane?.faceId;
+    this.reset(ctx);
+    if (!plane || !a || !b || !faceId || a.distanceTo(b) < 1e-6) return;
+    void documentStore.drawLineSegment(
+      [plane.origin.x, plane.origin.y, plane.origin.z],
+      [plane.normal.x, plane.normal.y, plane.normal.z],
+      [a.x, a.y],
+      [b.x, b.y],
+      faceId,
+    );
+    this.onCommitted?.();
+  }
+
+  private reset(ctx: ToolContext) {
+    this.activePlane = null;
+    this.startUv = null;
+    this.currentUv = null;
+    this.numeric.clear();
+    this.preview.clear(ctx.scene);
+    this.snapIndicator.hide();
+    measurementHud.hide();
+  }
+}

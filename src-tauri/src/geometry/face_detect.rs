@@ -355,6 +355,19 @@ fn distance_to_segment(p: DVec2, a: DVec2, b: DVec2) -> f64 {
     (p - (a + ab * t)).length()
 }
 
+/// True if `p` lies within `tolerance` of any EDGE of `loop_points` (a closed
+/// ring) - unlike `point_in_or_near_polygon`, does not also match points
+/// merely inside the polygon's interior. Used by `Document::draw_line_segment`
+/// to require a chord's endpoints land ON the target face's own boundary (its
+/// outer ring or a hole ring), not just anywhere inside it: the latter is
+/// what `point_in_or_near_polygon` allows and is correct for a closed shape
+/// sketched inside a face, but a chord that doesn't terminate on the boundary
+/// can't actually bisect the face into two closed regions.
+pub(crate) fn point_near_boundary(p: DVec2, loop_points: &[DVec2], tolerance: f64) -> bool {
+    let n = loop_points.len();
+    (0..n).any(|i| distance_to_segment(p, loop_points[i], loop_points[(i + 1) % n]) < tolerance)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +402,19 @@ mod tests {
         let faces = detect_faces(&points, &edges);
         assert_eq!(faces.len(), 2);
         assert!(faces.iter().all(|f| f.holes.is_empty()));
+    }
+
+    #[test]
+    fn point_near_boundary_matches_edges_not_the_interior() {
+        let square = vec![
+            DVec2::new(0.0, 0.0),
+            DVec2::new(10.0, 0.0),
+            DVec2::new(10.0, 10.0),
+            DVec2::new(0.0, 10.0),
+        ];
+        assert!(point_near_boundary(DVec2::new(5.0, 0.0), &square, 1e-2), "midpoint of an edge should match");
+        assert!(point_near_boundary(DVec2::new(0.0, 0.0), &square, 1e-2), "a corner should match");
+        assert!(!point_near_boundary(DVec2::new(5.0, 5.0), &square, 1e-2), "the center is inside, not near any edge");
     }
 
     #[test]

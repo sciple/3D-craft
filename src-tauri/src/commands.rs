@@ -172,6 +172,22 @@ pub fn draw_polygon(
 }
 
 #[tauri::command]
+pub fn draw_line_segment(
+    state: State<AppState>,
+    plane_origin: DVec3,
+    plane_normal: DVec3,
+    point_a: DVec2,
+    point_b: DVec2,
+    target_face_id: FaceId,
+) -> DocumentSnapshot {
+    let mut history = state.0.lock().unwrap();
+    history.record();
+    let plane = Plane::from_normal(plane_origin, plane_normal);
+    history.document.draw_line_segment(&plane, point_a, point_b, target_face_id);
+    history.document.snapshot()
+}
+
+#[tauri::command]
 pub fn push_pull_face(state: State<AppState>, face_id: FaceId, distance: f64) -> DocumentSnapshot {
     let mut history = state.0.lock().unwrap();
     history.record();

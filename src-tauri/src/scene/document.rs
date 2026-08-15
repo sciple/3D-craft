@@ -23,6 +23,14 @@ new_key_type! {
 /// (see CLAUDE.md's "1 world unit = 1mm" note).
 const PRINT_ARRANGE_SPACING: f64 = 10.0;
 
+/// How close (in plane-local mm) a freshly-drawn point must land to an
+/// existing face's boundary to count as "on" it. Used both by
+/// `resplit_face_with_loops` (a whole extra loop must fit inside/near the
+/// target face) and `draw_line_segment` (each chord endpoint must land on
+/// the target face's own boundary specifically, not just anywhere inside
+/// it - see `face_detect::point_near_boundary`).
+const FACE_FIT_TOLERANCE: f64 = 1e-2;
+
 /// A simple named collection of faces, moved/renamed together. No shared
 /// component-definition/instance system - each group just owns its faces
 /// directly, which is enough for one-off spaceship parts (hull, wing, ...).
@@ -165,6 +173,54 @@ impl Document {
         self.resplit(plane, new_loop, target_face_id)
     }
 
+    /// Draws a single straight open segment across `target_face_id` and
+    /// splits it into two separate faces along the chord (e.g. the diagonal
+    /// of a rectangle becomes two triangles) - the "cut a face so only half
+    /// of it can be pushed/pulled" workflow. Unlike every other `draw_*`
+    /// method, `target_face_id` is required, not optional: a chord only
+    /// makes sense relative to one specific host face it must terminate on,
+    /// and `resplit_plane`'s document-wide coplanar merge has no
+    /// fit-validation against a single boundary, so it's unsound for a chord
+    /// (it could bridge two unrelated coplanar faces into garbage topology).
+    /// Returns an empty Vec (no-op) if `target_face_id` doesn't exist or
+    /// either endpoint doesn't land on/near the face's own boundary (its
+    /// outer ring or a hole ring) - see `face_detect::point_near_boundary`.
+    /// An endpoint merely inside the face (not on its boundary) can't
+    /// actually bisect it, so this is checked separately from
+    /// `resplit_face_with_loops`'s own (interior-inclusive) fit check.
+    pub fn draw_line_segment(&mut self, plane: &Plane, point_a: DVec2, point_b: DVec2, target_face_id: FaceId) -> Vec<FaceId> {
+        let Some(face) = self.mesh.faces.get(target_face_id) else {
+            return Vec::new();
+        };
+        let outer_2d: Vec<DVec2> = face.outer.iter().map(|&v| plane.to_2d(self.mesh.position(v))).collect();
+        let holes_2d: Vec<Vec<DVec2>> = face
+            .holes
+            .iter()
+            .map(|h| h.iter().map(|&v| plane.to_2d(self.mesh.position(v))).collect())
+            .collect();
+
+        let on_boundary = |p: DVec2| {
+            face_detect::point_near_boundary(p, &outer_2d, FACE_FIT_TOLERANCE)
+                || holes_2d.iter().any(|h| face_detect::point_near_boundary(p, h, FACE_FIT_TOLERANCE))
+        };
+        if !on_boundary(point_a) || !on_boundary(point_b) {
+            return Vec::new();
+        }
+
+        let va = self.mesh.add_vertex(plane.to_3d(point_a));
+        let vb = self.mesh.add_vertex(plane.to_3d(point_b));
+        // A 2-element "loop" [va, vb] passed through resplit_loops's
+        // closed-loop edge-building (which wraps i+1 back to 0) happens to
+        // emit exactly the two directed halves of one undirected chord edge
+        // - (va,vb) then (vb,va) - which is mathematically correct for N=2
+        // specifically, proven by
+        // face_detect::diagonal_splits_rectangle_into_two_faces. This does
+        // NOT generalize to more than 2 points (a 3+-point open path would
+        // pick up a spurious closing edge back to its start), which is why
+        // this method takes two fixed DVec2 params rather than a Vec<DVec2>.
+        self.resplit_face_with_loops(target_face_id, vec![vec![va, vb]])
+    }
+
     /// Routes a freshly drawn loop to either a single target face's own
     /// resplit (sketching on a solid's side wall to cut a porthole/hatch
     /// without disturbing unrelated coplanar geometry) or the general
@@ -288,7 +344,6 @@ impl Document {
         // matching `inset_face`'s no-op-on-invalid-input pattern - and let
         // the small tolerance still allow the common, legitimate case of a
         // corner sketched exactly on this face's own edge or corner.
-        const FACE_FIT_TOLERANCE: f64 = 1e-2;
         let outer_2d: Vec<DVec2> = face.outer.iter().map(|&v| plane.to_2d(self.mesh.position(v))).collect();
         for loop_vertices in &extra_loops {
             for &vid in loop_vertices {
@@ -328,7 +383,14 @@ impl Document {
         // is a different face and is left untouched, so dropping the refill is
         // always right here (unlike in `resplit_plane`, which erases and
         // rebuilds a whole set of coplanar faces at once).
-        let protected_holes = face.holes.clone();
+        //
+        // `face.holes` alone isn't a complete answer, though: a hole that
+        // `Document::draw_line_segment` has already bridged to the outer
+        // boundary (a radial cut through a ring) is folded into a
+        // self-touching `outer` with no separate `.holes` entry at all, so a
+        // SECOND resplit of the same face (e.g. a second radial cut) must
+        // still know to protect it - see `protected_regions_within`.
+        let protected_holes = self.protected_regions_within(&plane, face);
         let mut loops = vec![face.outer.clone()];
         loops.extend(face.holes.iter().cloned());
         loops.extend(extra_loops.iter().cloned());
@@ -556,22 +618,13 @@ impl Document {
     }
 
     /// Builds the combined 2D edge graph for `loops` (each a closed ring of
-    /// mesh vertices, already known to be coplanar with `plane`), re-detects
-    /// faces/holes over it, and creates the resulting faces. Shared by
-    /// `resplit_plane` (sticky-geometry auto-split while drawing) and
-    /// `inset_face` (splitting one face into an inner face + offset frame).
-    ///
-    /// `protected_holes` are loops that must stay empty: `face_detect`
-    /// reports every enclosed region it finds, including the inside of a
-    /// hole the source face already had, so without this it would
-    /// re-materialize a face there. See `resplit_face_with_loops` for why
-    /// that's wrong.
-    fn resplit_loops(
-        &mut self,
-        plane: &Plane,
-        loops: Vec<Vec<VertexId>>,
-        protected_holes: &[Vec<VertexId>],
-    ) -> Vec<FaceId> {
+    /// mesh vertices, already known to be coplanar with `plane`) and runs
+    /// `face_detect` over it, translating each detected region's outer/holes
+    /// back to `VertexId`s - without creating any `Face`s yet. Shared by
+    /// `resplit_loops` (which materializes the surviving results) and
+    /// `protected_regions_within` (which uses the same detection purely to
+    /// discover which regions must stay empty).
+    fn detect_regions(&self, plane: &Plane, loops: &[Vec<VertexId>]) -> Vec<(Vec<VertexId>, Vec<Vec<VertexId>>)> {
         // Two loops can reference *different* VertexIds at what's meant to
         // be the same position - most commonly a freshly-drawn shape whose
         // corner was snapped onto an existing vertex/edge/guide: the
@@ -590,7 +643,7 @@ impl Document {
         let mut vertex_by_index: Vec<VertexId> = Vec::new();
         let mut edges: Vec<(usize, usize)> = Vec::new();
 
-        for loop_vertices in &loops {
+        for loop_vertices in loops {
             let local_indices: Vec<usize> = loop_vertices
                 .iter()
                 .map(|&vid| {
@@ -624,22 +677,55 @@ impl Document {
             }
         }
 
-        let detected = face_detect::detect_faces(&points, &edges);
-
-        detected
+        face_detect::detect_faces(&points, &edges)
             .into_iter()
-            .filter_map(|df| {
+            .map(|df| {
                 let outer: Vec<VertexId> = df.outer.iter().map(|&i| vertex_by_index[i]).collect();
-                if loop_covers_any(&outer, protected_holes) {
+                let holes: Vec<Vec<VertexId>> = df.holes.iter().map(|h| h.iter().map(|&i| vertex_by_index[i]).collect()).collect();
+                (outer, holes)
+            })
+            .collect()
+    }
+
+    /// Runs `detect_regions` on `loops` and creates a `Face` for every
+    /// surviving detected region. Shared by `resplit_plane` (sticky-geometry
+    /// auto-split while drawing) and `inset_face` (splitting one face into an
+    /// inner face + offset frame).
+    ///
+    /// `protected_holes` are loops that must stay empty: `face_detect`
+    /// reports every enclosed region it finds, including the inside of a
+    /// hole the source face already had, so without this it would
+    /// re-materialize a face there. See `resplit_face_with_loops` for why
+    /// that's wrong.
+    fn resplit_loops(&mut self, plane: &Plane, loops: Vec<Vec<VertexId>>, protected_holes: &[Vec<VertexId>]) -> Vec<FaceId> {
+        self.detect_regions(plane, &loops)
+            .into_iter()
+            .filter_map(|(outer, holes)| {
+                if loop_covers_any(&self.mesh, plane, &outer, protected_holes) {
                     return None;
                 }
-                let holes: Vec<Vec<VertexId>> = df
-                    .holes
-                    .iter()
-                    .map(|h| h.iter().map(|&i| vertex_by_index[i]).collect())
-                    .collect();
                 Some(self.mesh.add_face(outer, holes))
             })
+            .collect()
+    }
+
+    /// Discovers every region within `face`'s own current boundary that must
+    /// stay empty - not just `face.holes` directly. A hole that
+    /// `draw_line_segment` has already bridged to the outer boundary (a
+    /// radial cut through a ring) is folded into a self-touching `outer`
+    /// loop with no separate `.holes` entry at all, so a caller relying on
+    /// `face.holes` alone would forget it ever existed. Re-running detection
+    /// on exactly `face`'s own current boundary, with no new geometry added,
+    /// deterministically reproduces the same decomposition that originally
+    /// produced it: the one detected region matching `face.outer` itself
+    /// (exactly, since nothing changed) is always the "whole material"
+    /// candidate; everything else - whether currently listed in `.holes` or
+    /// currently folded into `outer` - must stay empty.
+    fn protected_regions_within(&self, plane: &Plane, face: &Face) -> Vec<Vec<VertexId>> {
+        let own_loops: Vec<Vec<VertexId>> = std::iter::once(face.outer.clone()).chain(face.holes.iter().cloned()).collect();
+        self.detect_regions(plane, &own_loops)
+            .into_iter()
+            .filter_map(|(outer, _)| (!matches_any_loop(&outer, std::slice::from_ref(&face.outer))).then_some(outer))
             .collect()
     }
 
@@ -1270,23 +1356,52 @@ fn matches_any_loop(subject: &[VertexId], candidates: &[Vec<VertexId>]) -> bool 
 /// `a_sketch_touching_an_existing_studs_rim_does_not_refill_that_rim`).
 ///
 /// A false positive here *drops* a face, so the looser test has to stay
-/// tight in that direction - and it does: the detected regions partition the
-/// source face's area with the hole excluded from it, so the only region that
-/// can contain *every* vertex of a hole's loop is that hole's own region. A
-/// neighboring region touches only part of the loop, and a region enclosing
-/// the hole carries it among its `holes` rather than in its outer.
+/// tight in that direction. Vertex-set containment alone isn't tight enough,
+/// though: `Document::draw_line_segment`'s radial cuts (outer boundary to a
+/// hole's boundary) prove the counterexample the old doc comment here missed
+/// - bridging a hole to the outer ring, as a single cut through an annulus
+/// does, produces one "opened" face whose own boundary legitimately walks
+/// every vertex of the hole (it borders the hole all the way around), even
+/// though that face is a completely different, much larger region, not a
+/// refill of the hole. Requiring the areas to match (T-junction insertion
+/// never changes enclosed area, since inserted points are collinear) is what
+/// rules that out while still tolerating genuine T-junction extensions.
 ///
 /// Deliberately not folded into `matches_any_loop`: that one also answers
 /// "did an erased face fill this hole" in `resplit_plane`, where a smaller
 /// candidate loop genuinely is a different loop and must not match.
-fn loop_covers_any(subject: &[VertexId], candidates: &[Vec<VertexId>]) -> bool {
+fn loop_covers_any(mesh: &Mesh, plane: &Plane, subject: &[VertexId], candidates: &[Vec<VertexId>]) -> bool {
     if candidates.is_empty() {
         return false;
     }
     let subject_set: HashSet<VertexId> = subject.iter().copied().collect();
-    candidates
-        .iter()
-        .any(|c| c.len() <= subject.len() && c.iter().all(|v| subject_set.contains(v)))
+    let subject_area = ring_area(mesh, plane, subject);
+    candidates.iter().any(|c| {
+        c.len() <= subject.len()
+            && c.iter().all(|v| subject_set.contains(v))
+            && areas_match(subject_area, ring_area(mesh, plane, c))
+    })
+}
+
+/// Unsigned area of a closed `VertexId` ring, projected onto `plane`.
+fn ring_area(mesh: &Mesh, plane: &Plane, loop_vertices: &[VertexId]) -> f64 {
+    let points: Vec<DVec2> = loop_vertices.iter().map(|&v| plane.to_2d(mesh.position(v))).collect();
+    let n = points.len();
+    let mut area = 0.0;
+    for i in 0..n {
+        let p0 = points[i];
+        let p1 = points[(i + 1) % n];
+        area += p0.x * p1.y - p1.x * p0.y;
+    }
+    (area / 2.0).abs()
+}
+
+/// Loose-enough-for-floating-point, tight-enough-to-distinguish-shapes area
+/// comparison for `loop_covers_any`. T-junction insertion doesn't change a
+/// loop's enclosed area at all (inserted points are exactly collinear), so
+/// this only needs to absorb rounding noise, not any real discrepancy.
+fn areas_match(a: f64, b: f64) -> bool {
+    (a - b).abs() < b * 1e-6 + 1e-9
 }
 
 /// A face is coplanar with `plane` when it faces the same way (not the
@@ -1474,6 +1589,192 @@ mod tests {
         let face_ids = doc.draw_polygon(&plane, vec![DVec2::ZERO, DVec2::new(1.0, 0.0)], None);
         assert!(face_ids.is_empty());
         assert!(doc.mesh.faces.is_empty());
+    }
+
+    #[test]
+    fn draw_line_segment_splits_a_rectangle_into_two_triangles_along_its_diagonal() {
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), None)[0];
+
+        let new_faces = doc.draw_line_segment(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), face_id);
+        assert_eq!(new_faces.len(), 2);
+        assert_eq!(doc.mesh.faces.len(), 2);
+        for &fid in &new_faces {
+            let face = &doc.mesh.faces[fid];
+            assert_eq!(face.outer.len(), 3, "each half of a rectangle split corner-to-corner is a triangle");
+            let pulled = doc.push_pull(fid, 2.0);
+            assert!(pushpull::is_manifold(&doc.mesh, &pulled), "each triangle must independently push/pull into a manifold solid");
+        }
+    }
+
+    #[test]
+    fn draw_line_segment_with_an_interior_endpoint_is_a_no_op() {
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), None)[0];
+
+        // (5,5) is the rectangle's center - well inside, not on any edge.
+        let new_faces = doc.draw_line_segment(&plane, DVec2::ZERO, DVec2::new(5.0, 5.0), face_id);
+        assert!(new_faces.is_empty());
+        assert_eq!(doc.mesh.faces.len(), 1, "an endpoint that doesn't land on the boundary must not split the face");
+    }
+
+    #[test]
+    fn draw_line_segment_from_edge_midpoint_to_opposite_edge_midpoint_splits_into_two_quads() {
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), None)[0];
+
+        // Neither point is an existing vertex - each lands partway along an
+        // edge's interior, exercising the T-junction path.
+        let new_faces = doc.draw_line_segment(&plane, DVec2::new(5.0, 0.0), DVec2::new(5.0, 10.0), face_id);
+        assert_eq!(new_faces.len(), 2);
+        for &fid in &new_faces {
+            assert_eq!(doc.mesh.faces[fid].outer.len(), 4, "a cut between two edge midpoints halves a rectangle into two quads");
+        }
+    }
+
+    /// Builds an annulus (a ring face with one hole) by drawing two
+    /// concentric circles and erasing the inner disk - mirrors
+    /// `erasing_inner_circle_leaves_the_outer_as_a_printable_ring`. Returns
+    /// (doc, ring_face_id).
+    fn make_annulus(outer_radius: f64, inner_radius: f64, segments: usize) -> (Document, FaceId) {
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        doc.draw_circle(&plane, DVec2::ZERO, outer_radius, segments, None);
+        doc.draw_circle(&plane, DVec2::ZERO, inner_radius, segments, None);
+        let inner_id = doc.mesh.faces.iter().find(|(_, f)| f.holes.is_empty()).unwrap().0;
+        doc.erase_face(inner_id);
+        let ring_id = doc.mesh.faces.iter().next().unwrap().0;
+        (doc, ring_id)
+    }
+
+    /// Total triangulated area of `face_id`, in world units - used by the
+    /// annulus tests below to confirm a cut face's material still excludes
+    /// exactly the hole's area, regardless of whether the hole is currently
+    /// encoded as a separate `.holes` loop or folded into a self-touching
+    /// `outer` loop by a bridging chord.
+    fn triangulated_area(doc: &Document, face_id: FaceId) -> f64 {
+        triangulate_face(&doc.mesh, &doc.mesh.faces[face_id])
+            .iter()
+            .map(|tri| {
+                let (a, b, c) = (doc.mesh.position(tri[0]), doc.mesh.position(tri[1]), doc.mesh.position(tri[2]));
+                0.5 * (b - a).truncate().perp_dot((c - a).truncate()).abs()
+            })
+            .sum()
+    }
+
+    /// Exact area of a regular n-gon inscribed in radius `r` - what
+    /// `add_circle`'s polygon approximation actually draws, unlike
+    /// `pi * r * r` which only holds in the limit of infinite segments.
+    fn ngon_area(r: f64, segments: f64) -> f64 {
+        0.5 * segments * r * r * (std::f64::consts::TAU / segments).sin()
+    }
+
+    #[test]
+    fn a_single_radial_cut_on_an_annulus_does_not_split_it_but_keeps_the_hole_open() {
+        // Topological fact, not a bug: a genus-1 (one-hole) face needs TWO
+        // cuts from outer to inner boundary to separate into two pieces - one
+        // cut alone just "unrolls" the ring into a single still-connected
+        // C-shape (same visible material, still one face). Whether that
+        // material's hole is still encoded as a separate `.holes` loop or
+        // folded into a self-touching `outer` by the bridge is an internal
+        // representation detail - either way the triangulated area must
+        // still exclude the hole.
+        let (mut doc, ring_id) = make_annulus(10.0, 4.0, 16);
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let new_faces = doc.draw_line_segment(&plane, DVec2::new(10.0, 0.0), DVec2::new(4.0, 0.0), ring_id);
+        assert_eq!(new_faces.len(), 1, "one radial cut re-detects the same single ring face, not two pieces");
+        assert_eq!(doc.mesh.faces.len(), 1);
+
+        let expected = ngon_area(10.0, 16.0) - ngon_area(4.0, 16.0);
+        assert!(
+            (triangulated_area(&doc, new_faces[0]) - expected).abs() < 1e-6,
+            "the hole must stay excluded from the material after a single bridging cut"
+        );
+    }
+
+    #[test]
+    fn two_radial_cuts_split_an_annulus_into_two_independently_pushable_arcs() {
+        let (mut doc, ring_id) = make_annulus(10.0, 4.0, 16);
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let full_ring_area = ngon_area(10.0, 16.0) - ngon_area(4.0, 16.0);
+
+        // First radial cut at angle 0 (both circles are 16-gons, so (10,0)
+        // and (4,0) are exact existing vertices).
+        let after_first = doc.draw_line_segment(&plane, DVec2::new(10.0, 0.0), DVec2::new(4.0, 0.0), ring_id);
+        assert_eq!(after_first.len(), 1);
+        let opened_ring_id = after_first[0];
+
+        // Second radial cut at angle 180 (also an exact vertex on both
+        // 16-gons: 180 / (360/16) = 8). Must NOT resurrect the hole's own
+        // interior as a spurious third face now that the first cut folded it
+        // out of `.holes` - see `protected_regions_within`.
+        let halves = doc.draw_line_segment(&plane, DVec2::new(-10.0, 0.0), DVec2::new(-4.0, 0.0), opened_ring_id);
+        assert_eq!(halves.len(), 2, "a second radial cut must now separate the opened ring into two arc pieces, not resurrect the hole as a third face");
+        assert_eq!(doc.mesh.faces.len(), 2);
+
+        let mut total_area = 0.0;
+        for &fid in &halves {
+            let face = &doc.mesh.faces[fid];
+            assert!(face.holes.is_empty(), "each half-annulus arc is solid material, not itself a ring with a hole");
+            total_area += triangulated_area(&doc, fid);
+            let pulled = doc.push_pull(fid, 3.0);
+            assert!(pushpull::is_manifold(&doc.mesh, &pulled), "each arc must independently push/pull into a manifold solid");
+        }
+        assert!((total_area - full_ring_area).abs() < 1e-6, "the two arcs together must account for the whole ring's material, no more and no less");
+    }
+
+    #[test]
+    fn draw_line_segment_on_a_solids_top_face_stays_manifold_after_pushing_just_one_half() {
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let base_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), None)[0];
+        let box_faces = doc.push_pull(base_id, 5.0);
+        let top_id = box_faces
+            .iter()
+            .copied()
+            .find(|&id| (doc.mesh.faces[id].normal - DVec3::Z).length() < 1e-9)
+            .expect("push_pull upward should leave a top cap facing +Z");
+        // The top cap sits at z=5, not z=0 - its own plane must be anchored
+        // there (u/v match the ground plane's since both share normal +Z,
+        // but the origin must be on the actual face for to_2d/to_3d to
+        // round-trip through the right height).
+        let top_face = &doc.mesh.faces[top_id];
+        let top_plane = Plane::from_normal(doc.mesh.position(top_face.outer[0]), top_face.normal);
+
+        let halves = doc.draw_line_segment(&top_plane, DVec2::ZERO, DVec2::new(10.0, 10.0), top_id);
+        assert_eq!(halves.len(), 2);
+
+        doc.push_pull(halves[0], 3.0);
+        let all_faces: Vec<FaceId> = doc.mesh.faces.keys().collect();
+        assert!(pushpull::is_manifold(&doc.mesh, &all_faces), "pulling only one triangular half of a cut solid cap must keep the whole solid watertight");
+    }
+
+    #[test]
+    fn draw_line_segment_preserves_group_and_solid_membership() {
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), None)[0];
+        let group_id = doc.group_faces(&[face_id], "panel".to_string());
+
+        let new_faces = doc.draw_line_segment(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), face_id);
+        assert_eq!(doc.groups[group_id].face_ids.len(), 2);
+        for &fid in &new_faces {
+            assert!(doc.groups[group_id].face_ids.contains(&fid));
+        }
+    }
+
+    #[test]
+    fn draw_line_segment_with_a_stale_target_face_id_is_a_no_op() {
+        let mut doc = Document::new();
+        let plane = Plane::from_normal(DVec3::ZERO, DVec3::Z);
+        let face_id = doc.draw_rectangle(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), None)[0];
+        doc.erase_face(face_id);
+
+        let new_faces = doc.draw_line_segment(&plane, DVec2::ZERO, DVec2::new(10.0, 10.0), face_id);
+        assert!(new_faces.is_empty());
     }
 
     #[test]
