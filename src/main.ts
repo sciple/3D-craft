@@ -6,7 +6,7 @@ import { documentStore } from "./state/document-store";
 import { ToolManager } from "./tools/tool-manager";
 import type { ToolContext } from "./tools/types";
 import { SelectTool } from "./tools/select-tool";
-import { DrawRectangleTool, DrawCircleTool, DrawArcTool, DrawNgonTool, DrawPolygonTool } from "./tools/draw-tool";
+import { DrawRectangleTool, DrawCircleTool, DrawArcTool, DrawNgonTool, DrawPolygonTool, DrawLineSegmentTool } from "./tools/draw-tool";
 import { PushPullTool } from "./tools/pushpull-tool";
 import { InsetTool } from "./tools/inset-tool";
 import { ScaleTool } from "./tools/scale-tool";
@@ -45,6 +45,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   const arcTool = new DrawArcTool(returnToSelect);
   const ngonTool = new DrawNgonTool(returnToSelect);
   const polygonTool = new DrawPolygonTool(returnToSelect);
+  const lineSegmentTool = new DrawLineSegmentTool(returnToSelect);
   const pushPullTool = new PushPullTool();
   const insetTool = new InsetTool();
   const scaleTool = new ScaleTool();
@@ -59,6 +60,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     { tool: arcTool, label: "Arc", shortcut: "a", icon: icons.arc },
     { tool: ngonTool, label: "N-Gon", shortcut: "n", icon: icons.ngon },
     { tool: polygonTool, label: "Polygon", shortcut: "l", icon: icons.polygon },
+    { tool: lineSegmentTool, label: "Line Segment", shortcut: "k", icon: icons.lineSegment },
     { tool: pushPullTool, label: "Push/Pull", shortcut: "p", icon: icons.pushPull },
     { tool: insetTool, label: "Inset", shortcut: "i", icon: icons.inset },
     { tool: scaleTool, label: "Scale", shortcut: "g", icon: icons.scale },

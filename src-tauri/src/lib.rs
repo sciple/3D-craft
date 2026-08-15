@@ -19,6 +19,7 @@ pub fn run() {
             commands::draw_arc,
             commands::draw_ngon,
             commands::draw_polygon,
+            commands::draw_line_segment,
             commands::push_pull_face,
             commands::push_pull_faces,
             commands::inset_face,

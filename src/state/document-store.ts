@@ -288,6 +288,24 @@ class DocumentStore {
     });
   }
 
+  /// Cuts `targetFaceId` into two separate faces along the straight chord
+  /// from `a` to `b` - unlike every other draw method here, `targetFaceId`
+  /// is required: a chord only makes sense relative to one specific face it
+  /// must terminate on (see `Document::draw_line_segment` on the Rust side).
+  drawLineSegment(planeOrigin: Vec3, planeNormal: Vec3, a: Vec2, b: Vec2, targetFaceId: FaceId) {
+    return this.enqueue(async () => {
+      this.applyEdit(
+        await invoke<DocumentSnapshot>("draw_line_segment", {
+          planeOrigin,
+          planeNormal,
+          pointA: a,
+          pointB: b,
+          targetFaceId,
+        }),
+      );
+    });
+  }
+
   pushPullFace(faceId: FaceId, distance: number) {
     return this.enqueue(async () => {
       this.applyEdit(await invoke<DocumentSnapshot>("push_pull_face", { faceId, distance }));
